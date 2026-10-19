@@ -1,0 +1,11 @@
+#!/bin/sh
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.bun/bin:$PATH"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+if command -v bun >/dev/null 2>&1; then
+  exec bun "$SCRIPT_DIR/../src/cli.ts" "$@"
+elif command -v node >/dev/null 2>&1; then
+  exec node "$SCRIPT_DIR/../src/cli.ts" "$@"
+else
+  echo "oc-yubikey: neither bun nor node found in PATH" >&2
+  exit 1
+fi
