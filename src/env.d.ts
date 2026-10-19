@@ -74,7 +74,13 @@ declare module "node:fs" {
     options?: { recursive?: boolean; mode?: number },
   ): string | undefined
   export function mkdtempSync(prefix: string): string
+  export interface Dirent {
+    readonly name: string
+    isDirectory(): boolean
+    isFile(): boolean
+  }
   export function readdirSync(path: string): string[]
+  export function readdirSync(path: string, options: { withFileTypes: true }): Dirent[]
   export function readFileSync(path: string, encoding: "utf8"): string
   export function realpathSync(path: string): string
   export function renameSync(oldPath: string, newPath: string): void
@@ -130,12 +136,14 @@ declare module "node:path" {
   export function resolve(...paths: string[]): string
   export function dirname(p: string): string
   export function basename(p: string): string
+  export function relative(from: string, to: string): string
   export function isAbsolute(p: string): boolean
   const pathDefault: {
     join: typeof join
     resolve: typeof resolve
     dirname: typeof dirname
     basename: typeof basename
+    relative: typeof relative
     isAbsolute: typeof isAbsolute
   }
   export default pathDefault
@@ -513,17 +521,31 @@ declare module "@opentui/solid" {
       }
       text: {
         readonly attributes?: number
-        readonly fg?: string
+        readonly fg?: string | (() => string)
         readonly wrapMode?: "word" | "char" | "none"
         readonly onMouseUp?: () => void
         readonly children?: unknown
       }
       span: {
-        readonly style?: { readonly fg?: string }
+        readonly style?: { readonly fg?: string } | (() => { readonly fg?: string })
         readonly children?: unknown
       }
     }
   }
+
+  export function createElement(tag: keyof JSX.IntrinsicElements): JSX.Element
+  export function createTextNode(value: string): JSX.Element
+  export function insertNode(parent: JSX.Element, node: JSX.Element, anchor?: JSX.Element): void
+  export function insert(
+    parent: JSX.Element,
+    accessor: unknown,
+    marker?: JSX.Element | null,
+    initial?: unknown,
+  ): JSX.Element
+  export function setProp<T>(node: JSX.Element, name: string, value: T, prev?: T): T
+  export function effect<T>(fn: (prev?: T) => T, init?: T): void
+  export function memo<T>(fn: () => T, equal?: boolean): () => T
+  export function createComponent<P>(Comp: (props: P) => JSX.Element, props: P): JSX.Element
 }
 
 declare module "@opentui/solid/jsx-runtime" {

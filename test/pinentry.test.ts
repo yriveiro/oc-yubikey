@@ -14,16 +14,16 @@ import {
   isAppleLaunchdSshAgentSocket,
   parseSshAgentSignRequest,
   resolvePinentryCliPath,
-} from "../src/bridge.js"
-import { PinentryCoordinator, type PromptOutputByKind } from "../src/coordinator.js"
-import { sanitizeDisplayText } from "../src/protocol.js"
+} from "../src/bridge.ts"
+import { PinentryCoordinator, type PromptOutputByKind } from "../src/coordinator.ts"
+import { sanitizeDisplayText } from "../src/protocol.ts"
 import type {
   PromptPinOutput,
   PromptTouchOutput,
   RequestSummary,
   ResolvedEvent,
   YubiKeyCardStatus,
-} from "../src/rpc.js"
+} from "../src/rpc.ts"
 import {
   assuanPercentDecode,
   assuanPercentEncode,
@@ -31,7 +31,7 @@ import {
   parseCardStatusOutput,
   presetPassphraseInAgent,
   verifyYubiKeyPinLoopback,
-} from "../src/yubikey.js"
+} from "../src/yubikey.ts"
 
 type Equal<X, Y> = (<T>() => T extends X ? 1 : 2) extends <T>() => T extends Y ? 1 : 2
   ? true

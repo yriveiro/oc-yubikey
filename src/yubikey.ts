@@ -8,8 +8,8 @@ import {
   assuanPercentEncode,
   encodeAssuanData,
   parseAssuanData,
-} from "./protocol.js"
-import type { YubiKeyCardStatus } from "./rpc.js"
+} from "./protocol.ts"
+import type { YubiKeyCardStatus } from "./rpc.ts"
 
 export { assuanPercentDecode, assuanPercentEncode, encodeAssuanData, parseAssuanData }
 

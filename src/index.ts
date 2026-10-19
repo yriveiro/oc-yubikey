@@ -17,14 +17,14 @@ import {
   isAppleLaunchdSshAgentSocket,
   parseSshAgentSignRequest,
   resolvePinentryCliPath,
-} from "./bridge.js"
+} from "./bridge.ts"
 import {
   PinentryCoordinator,
   type PinentryCoordinatorOptions,
   type PromptInputByKind,
   type PromptOutputByKind,
-} from "./coordinator.js"
-import { sanitizeDisplayText } from "./protocol.js"
+} from "./coordinator.ts"
+import { sanitizeDisplayText } from "./protocol.ts"
 import {
   Pinentry,
   type RequestKind,
@@ -32,8 +32,8 @@ import {
   type ResolutionOutcome,
   type ResolvedEvent,
   type YubiKeyCardStatus,
-} from "./rpc.js"
-import { checkGpgAgentReady, getYubiKeyCardStatus, lockYubiKey } from "./yubikey.js"
+} from "./rpc.ts"
+import { checkGpgAgentReady, getYubiKeyCardStatus, lockYubiKey } from "./yubikey.ts"
 
 export {
   type AskpassClassification,
@@ -265,5 +265,5 @@ export default Plugin.define({
   },
 })
 
-export { Pinentry } from "./rpc.js"
-export * from "./yubikey.js"
+export { Pinentry } from "./rpc.ts"
+export * from "./yubikey.ts"

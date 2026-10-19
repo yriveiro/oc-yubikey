@@ -10,5 +10,5 @@ export {
   formatFriendlySshKeyType,
   parseSshAgentSignRequest,
   resolvePinentryCliPath,
-} from "./src/index.js"
-export * from "./src/yubikey.js"
+} from "./src/index.ts"
+export * from "./src/yubikey.ts"

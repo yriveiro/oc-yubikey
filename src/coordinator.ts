@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto"
-import { sanitizeDisplayText } from "./protocol.js"
+import { sanitizeDisplayText } from "./protocol.ts"
 import type {
   PromptPinInput,
   PromptPinOutput,
@@ -12,12 +12,12 @@ import type {
   UnlockInput,
   UnlockOutput,
   YubiKeyCardStatus,
-} from "./rpc.js"
+} from "./rpc.ts"
 import {
   type VerifyPinResult,
   getYubiKeyCardStatus,
   verifyYubiKeyPinLoopback,
-} from "./yubikey.js"
+} from "./yubikey.ts"
 
 export type PromptInputByKind = {
   readonly pin: PromptPinInput

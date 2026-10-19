@@ -14,7 +14,7 @@ import net from "node:net"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import type { PinentryCoordinator } from "./coordinator.js"
+import type { PinentryCoordinator } from "./coordinator.ts"
 import {
   type AskpassClassification,
   type SshFingerprint,
@@ -22,9 +22,9 @@ import {
   classifyAskpassPrompt,
   getRuntimeSocketDirPath,
   verifySecureSocketDir,
-} from "./protocol.js"
-import type { PromptTouchInput, PromptTouchOutput, YubiKeyCardStatus } from "./rpc.js"
-import { resolveTrustedExecutable } from "./yubikey.js"
+} from "./protocol.ts"
+import type { PromptTouchInput, PromptTouchOutput, YubiKeyCardStatus } from "./rpc.ts"
+import { resolveTrustedExecutable } from "./yubikey.ts"
 
 export { type AskpassClassification, type SshFingerprint, type SshKeyType, classifyAskpassPrompt }
 

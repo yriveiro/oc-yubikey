@@ -1,11 +1,110 @@
-/** @jsxImportSource @opentui/solid */
 import { Plugin } from "@opencode/plugin/tui"
-import type { Context, KeymapCommand, LocationRef, RpcClient } from "@opencode/plugin/tui/context"
+import type { Context, KeymapCommand, LocationRef, RpcClient, ThemeSurface } from "@opencode/plugin/tui/context"
 import { type KeyEvent, TextAttributes } from "@opentui/core"
-import { Show, createSignal, onCleanup, onMount } from "solid-js"
+import {
+  type JSX,
+  createComponent,
+  createElement,
+  createTextNode,
+  effect,
+  insert,
+  insertNode,
+  memo,
+  setProp,
+} from "@opentui/solid"
+import { createSignal, onCleanup, onMount } from "solid-js"
 import { Pinentry, type RequestSummary } from "./rpc.ts"
 
 const MAX_TUI_PIN_LENGTH = 128
+
+function applyProp(el: JSX.Element, key: string, value: unknown): void {
+  if (value === undefined) return
+  if (typeof value === "function" && !key.startsWith("on")) {
+    const compute = value as () => unknown
+    effect((prev) => setProp(el, key, compute(), prev))
+    return
+  }
+  setProp(el, key, value)
+}
+
+function appendChild(el: JSX.Element, child: unknown, multi: boolean): void {
+  if (child === null || child === undefined || typeof child === "boolean") return
+  if (typeof child === "string" || typeof child === "number") {
+    insertNode(el, createTextNode(String(child)))
+  } else if (typeof child === "function") {
+    insert(el, child, multi ? null : undefined)
+  } else {
+    insertNode(el, child as JSX.Element)
+  }
+}
+
+function h<K extends keyof JSX.IntrinsicElements>(
+  tag: K,
+  props?: JSX.IntrinsicElements[K] | null,
+  ...children: unknown[]
+): JSX.Element {
+  const el = createElement(tag)
+  if (props) {
+    for (const [key, value] of Object.entries(props)) {
+      applyProp(el, key, value)
+    }
+  }
+  const multi = children.length > 1
+  for (const child of children) {
+    appendChild(el, child, multi)
+  }
+  return el
+}
+
+function show(when: () => unknown, render: () => JSX.Element): JSX.Element {
+  const cond = memo(() => Boolean(when()), true)
+  return (() => (cond() ? render() : null)) as unknown as JSX.Element
+}
+
+function renderLabeledValue(theme: ThemeSurface, label: string, value: () => string): JSX.Element {
+  return h(
+    "text",
+    { fg: theme.text.muted },
+    `${label}: `,
+    h("span", { style: { fg: theme.text.base } }, value),
+  )
+}
+
+function renderCardMetaRow(theme: ThemeSurface, request: RequestSummary): JSX.Element {
+  return h(
+    "box",
+    { flexDirection: "row", gap: 2 },
+    show(
+      () => request.serial,
+      () => renderLabeledValue(theme, "Serial", () => request.serial ?? ""),
+    ),
+    show(
+      () => request.holder,
+      () => renderLabeledValue(theme, "Holder", () => request.holder ?? ""),
+    ),
+    show(
+      () => request.retriesLeft !== undefined,
+      () =>
+        h(
+          "text",
+          { fg: theme.text.muted },
+          "Retries: ",
+          h(
+            "span",
+            {
+              style: () => ({
+                fg:
+                  (request.retriesLeft ?? 3) <= 1
+                    ? theme.text.feedback.error.base
+                    : theme.text.base,
+              }),
+            },
+            () => String(request.retriesLeft ?? ""),
+          ),
+        ),
+    ),
+  )
+}
 
 interface PinentryModalProps {
   readonly context: Context
@@ -64,19 +163,16 @@ function PinentryModal(props: PinentryModalProps) {
       event.preventDefault()
       return
     }
-
     if (event.name === "escape") {
       event.preventDefault()
       void handleCancel("user-pressed-escape")
       return
     }
-
     if (event.name === "return" || event.name === "enter") {
       event.preventDefault()
       void handleSubmit()
       return
     }
-
     if (
       event.name === "tab" ||
       (event.ctrl && event.name === "r") ||
@@ -86,19 +182,16 @@ function PinentryModal(props: PinentryModalProps) {
       setReveal((prev) => !prev)
       return
     }
-
     if ((event.ctrl && event.name === "u") || (event.ctrl && event.name === "w")) {
       event.preventDefault()
       setPin("")
       return
     }
-
     if (event.name === "backspace" || event.name === "delete") {
       event.preventDefault()
       setPin((prev) => prev.slice(0, -1))
       return
     }
-
     if (!event.ctrl && !event.meta && event.sequence && event.sequence.length === 1) {
       const code = event.sequence.charCodeAt(0)
       if (code >= 0x20 && code !== 0x7f) {
@@ -128,115 +221,53 @@ function PinentryModal(props: PinentryModalProps) {
       props.request.serial || props.request.holder || props.request.retriesLeft !== undefined,
     )
 
-  return (
-    <box paddingLeft={2} paddingRight={2} paddingBottom={1} gap={1} flexDirection="column">
-      <box flexDirection="row" justifyContent="space-between">
-        <text attributes={TextAttributes.BOLD} fg={theme.text.base}>
-          🔑 {props.request.title || "YubiKey PIN Entry"}
-        </text>
-        <text fg={theme.text.muted} onMouseUp={() => void handleCancel("user-clicked-esc")}>
-          esc
-        </text>
-      </box>
-
-      <Show when={props.request.description}>
-        {(desc) => (
-          <text fg={theme.text.muted} wrapMode="word">
-            {desc()}
-          </text>
-        )}
-      </Show>
-
-      <Show when={hasCardMeta()}>
-        <box flexDirection="row" gap={2}>
-          <Show when={props.request.serial}>
-            {(serial) => (
-              <text fg={theme.text.muted}>
-                Serial: <span style={{ fg: theme.text.base }}>{serial()}</span>
-              </text>
-            )}
-          </Show>
-          <Show when={props.request.holder}>
-            {(holder) => (
-              <text fg={theme.text.muted}>
-                Holder: <span style={{ fg: theme.text.base }}>{holder()}</span>
-              </text>
-            )}
-          </Show>
-          <Show when={props.request.retriesLeft !== undefined}>
-            <text fg={theme.text.muted}>
-              Retries:{" "}
-              <span
-                style={{
-                  fg:
-                    (props.request.retriesLeft ?? 3) <= 1
-                      ? theme.text.feedback.error.base
-                      : theme.text.base,
-                }}
-              >
-                {props.request.retriesLeft}
-              </span>
-            </text>
-          </Show>
-        </box>
-      </Show>
-
-      <Show when={props.request.error}>
-        {(err) => (
-          <box
-            paddingLeft={1}
-            paddingRight={1}
-            backgroundColor={theme.background.feedback.error.base}
-          >
-            <text
-              attributes={TextAttributes.BOLD}
-              fg={theme.text.feedback.error.base}
-              wrapMode="word"
-            >
-              ⚠ {err()}
-            </text>
-          </box>
-        )}
-      </Show>
-
-      <box flexDirection="column" gap={1}>
-        <box flexDirection="row" justifyContent="space-between">
-          <text attributes={TextAttributes.BOLD} fg={theme.text.base}>
-            {props.request.prompt || "PIN:"}
-          </text>
-          <text fg={theme.text.muted}>
-            {pin().length > 0 ? `${pin().length} chars ` : ""}
-            {reveal() ? "(visible)" : "(masked)"}
-          </text>
-        </box>
-
-        <box
-          paddingLeft={1}
-          paddingRight={1}
-          backgroundColor={theme.background.raised.base}
-          flexDirection="row"
-        >
-          <text fg={pin().length > 0 ? theme.text.base : theme.text.muted}>
-            {pin().length > 0 ? `${maskedDisplay()}█` : "█ Enter YubiKey PIN…"}
-          </text>
-        </box>
-
-        <box flexDirection="row" gap={2} paddingTop={1}>
-          <text fg={theme.text.base} onMouseUp={() => void handleSubmit()}>
-            enter <span style={{ fg: theme.text.muted }}>unlock</span>
-          </text>
-          <text fg={theme.text.base} onMouseUp={() => setReveal((prev) => !prev)}>
-            tab/ctrl+r <span style={{ fg: theme.text.muted }}>{reveal() ? "hide" : "show"}</span>
-          </text>
-          <text fg={theme.text.base} onMouseUp={() => setPin("")}>
-            ctrl+u <span style={{ fg: theme.text.muted }}>clear</span>
-          </text>
-          <text fg={theme.text.base} onMouseUp={() => void handleCancel("user-clicked-cancel")}>
-            esc <span style={{ fg: theme.text.muted }}>cancel</span>
-          </text>
-        </box>
-      </box>
-    </box>
+  return h(
+    "box",
+    { paddingLeft: 2, paddingRight: 2, paddingBottom: 1, gap: 1, flexDirection: "column" },
+    h(
+      "box",
+      { flexDirection: "row", justifyContent: "space-between" },
+      h("text", { attributes: TextAttributes.BOLD, fg: theme.text.base }, () => `🔑 ${props.request.title || "YubiKey PIN Entry"}`),
+      h("text", { fg: theme.text.muted, onMouseUp: () => void handleCancel("user-clicked-esc") }, "esc"),
+    ),
+    show(() => props.request.description, () => h("text", { fg: theme.text.muted, wrapMode: "word" }, () => props.request.description ?? "")),
+    show(() => hasCardMeta(), () => renderCardMetaRow(theme, props.request)),
+    show(
+      () => props.request.error,
+      () =>
+        h(
+          "box",
+          { paddingLeft: 1, paddingRight: 1, backgroundColor: theme.background.feedback.error.base },
+          h("text", { attributes: TextAttributes.BOLD, fg: theme.text.feedback.error.base, wrapMode: "word" }, () => `⚠ ${props.request.error ?? ""}`),
+        ),
+    ),
+    h(
+      "box",
+      { flexDirection: "column", gap: 1 },
+      h(
+        "box",
+        { flexDirection: "row", justifyContent: "space-between" },
+        h("text", { attributes: TextAttributes.BOLD, fg: theme.text.base }, () => props.request.prompt || "PIN:"),
+        h("text", { fg: theme.text.muted }, () => `${pin().length > 0 ? `${pin().length} chars ` : ""}${reveal() ? "(visible)" : "(masked)"}`),
+      ),
+      h(
+        "box",
+        { paddingLeft: 1, paddingRight: 1, backgroundColor: theme.background.raised.base, flexDirection: "row" },
+        h(
+          "text",
+          { fg: () => (pin().length > 0 ? theme.text.base : theme.text.muted) },
+          () => (pin().length > 0 ? `${maskedDisplay()}█` : "█ Enter YubiKey PIN…"),
+        ),
+      ),
+      h(
+        "box",
+        { flexDirection: "row", gap: 2, paddingTop: 1 },
+        h("text", { fg: theme.text.base, onMouseUp: () => void handleSubmit() }, "enter ", h("span", { style: { fg: theme.text.muted } }, "unlock")),
+        h("text", { fg: theme.text.base, onMouseUp: () => setReveal((prev) => !prev) }, "tab/ctrl+r ", h("span", { style: { fg: theme.text.muted } }, () => (reveal() ? "hide" : "show"))),
+        h("text", { fg: theme.text.base, onMouseUp: () => setPin("") }, "ctrl+u ", h("span", { style: { fg: theme.text.muted } }, "clear")),
+        h("text", { fg: theme.text.base, onMouseUp: () => void handleCancel("user-clicked-cancel") }, "esc ", h("span", { style: { fg: theme.text.muted } }, "cancel")),
+      ),
+    ),
   )
 }
 
@@ -319,89 +350,55 @@ function TouchModal(props: TouchModalProps) {
         props.request.holder,
     )
 
-  return (
-    <box paddingLeft={2} paddingRight={2} paddingBottom={1} gap={1} flexDirection="column">
-      <box flexDirection="row" justifyContent="space-between">
-        <text attributes={TextAttributes.BOLD} fg={theme.text.base}>
-          👆 {props.request.title || "Touch Your YubiKey"}
-        </text>
-        <text fg={theme.text.muted} onMouseUp={() => void handleCancel("user-clicked-esc")}>
-          esc
-        </text>
-      </box>
-
-      <Show when={props.request.description}>
-        {(desc) => (
-          <text fg={theme.text.muted} wrapMode="word">
-            {desc()}
-          </text>
-        )}
-      </Show>
-
-      <box
-        paddingLeft={1}
-        paddingRight={1}
-        paddingTop={1}
-        paddingBottom={1}
-        backgroundColor={theme.background.raised.base}
-        flexDirection="row"
-        justifyContent="space-between"
-      >
-        <text attributes={TextAttributes.BOLD} fg={theme.text.feedback.warning.base}>
-          {pulse() ? "◉" : "◎"} Waiting for physical touch on your YubiKey…
-        </text>
-      </box>
-
-      <Show when={hasMeta()}>
-        <box flexDirection="column" gap={0}>
-          <Show when={props.request.command}>
-            {(cmd) => (
-              <text fg={theme.text.muted}>
-                Command: <span style={{ fg: theme.text.base }}>{cmd()}</span>
-              </text>
-            )}
-          </Show>
-          <Show when={props.request.keyType || props.request.fingerprint}>
-            <text fg={theme.text.muted}>
-              Key:{" "}
-              <span style={{ fg: theme.text.base }}>
-                {[props.request.keyType, props.request.fingerprint].filter(Boolean).join(" ")}
-              </span>
-            </text>
-          </Show>
-          <Show when={props.request.serial || props.request.holder}>
-            <box flexDirection="row" gap={2}>
-              <Show when={props.request.serial}>
-                {(serial) => (
-                  <text fg={theme.text.muted}>
-                    Serial: <span style={{ fg: theme.text.base }}>{serial()}</span>
-                  </text>
-                )}
-              </Show>
-              <Show when={props.request.holder}>
-                {(holder) => (
-                  <text fg={theme.text.muted}>
-                    Holder: <span style={{ fg: theme.text.base }}>{holder()}</span>
-                  </text>
-                )}
-              </Show>
-            </box>
-          </Show>
-        </box>
-      </Show>
-
-      <box flexDirection="row" justifyContent="space-between" paddingTop={1}>
-        <text fg={theme.text.muted}>Automatically closes when you touch the YubiKey</text>
-        <box flexDirection="row" gap={2}>
-          <text fg={theme.text.base} onMouseUp={() => void handleConfirm()}>
-            <span style={{ fg: theme.text.muted }}>dismiss</span>
-          </text>
-          <text fg={theme.text.base} onMouseUp={() => void handleCancel("user-clicked-cancel")}>
-            esc <span style={{ fg: theme.text.muted }}>cancel</span>
-          </text>
-        </box>
-      </box>
-    </box>
+  return h(
+    "box",
+    { paddingLeft: 2, paddingRight: 2, paddingBottom: 1, gap: 1, flexDirection: "column" },
+    h(
+      "box",
+      { flexDirection: "row", justifyContent: "space-between" },
+      h("text", { attributes: TextAttributes.BOLD, fg: theme.text.base }, () => `👆 ${props.request.title || "Touch Your YubiKey"}`),
+      h("text", { fg: theme.text.muted, onMouseUp: () => void handleCancel("user-clicked-esc") }, "esc"),
+    ),
+    show(() => props.request.description, () => h("text", { fg: theme.text.muted, wrapMode: "word" }, () => props.request.description ?? "")),
+    h(
+      "box",
+      { paddingLeft: 1, paddingRight: 1, paddingTop: 1, paddingBottom: 1, backgroundColor: theme.background.raised.base, flexDirection: "row", justifyContent: "space-between" },
+      h("text", { attributes: TextAttributes.BOLD, fg: theme.text.feedback.warning.base }, () => `${pulse() ? "◉" : "◎"} Waiting for physical touch on your YubiKey…`),
+    ),
+    show(
+      () => hasMeta(),
+      () =>
+        h(
+          "box",
+          { flexDirection: "column", gap: 0 },
+          show(() => props.request.command, () => renderLabeledValue(theme, "Command", () => props.request.command ?? "")),
+          show(
+            () => Boolean(props.request.keyType || props.request.fingerprint),
+            () => renderLabeledValue(theme, "Key", () => [props.request.keyType, props.request.fingerprint].filter(Boolean).join(" ")),
+          ),
+          show(
+            () => Boolean(props.request.serial || props.request.holder),
+            () =>
+              h(
+                "box",
+                { flexDirection: "row", gap: 2 },
+                show(() => props.request.serial, () => renderLabeledValue(theme, "Serial", () => props.request.serial ?? "")),
+                show(() => props.request.holder, () => renderLabeledValue(theme, "Holder", () => props.request.holder ?? "")),
+              ),
+          ),
+        ),
+    ),
+    h(
+      "box",
+      { flexDirection: "row", justifyContent: "space-between", paddingTop: 1 },
+      h("text", { fg: theme.text.muted }, "Automatically closes when you touch the YubiKey"),
+      h(
+        "box",
+        { flexDirection: "row", gap: 2 },
+        h("text", { fg: theme.text.base, onMouseUp: () => void handleConfirm() }, h("span", { style: { fg: theme.text.muted } }, "dismiss")),
+        h("text", { fg: theme.text.base, onMouseUp: () => void handleCancel("user-clicked-cancel") }, "esc ", h("span", { style: { fg: theme.text.muted } }, "cancel")),
+      ),
+    ),
   )
 }
 
@@ -452,38 +449,34 @@ function renderRequestModal(
   }
 
   if (next.kind === "touch") {
-    return (
-      <TouchModal
-        context={context}
-        request={next}
-        onConfirm={async () => {
-          settleDialogLocally(next.requestID)
-          await rpc
-            .confirmTouch({ requestID: next.requestID }, { location: targetLocation() })
-            .catch(() => {})
-        }}
-        onCancel={handleCancel}
-      />
-    )
+    return createComponent(TouchModal, {
+      context,
+      request: next,
+      onConfirm: async () => {
+        settleDialogLocally(next.requestID)
+        await rpc
+          .confirmTouch({ requestID: next.requestID }, { location: targetLocation() })
+          .catch(() => {})
+      },
+      onCancel: handleCancel,
+    })
   }
 
-  return (
-    <PinentryModal
-      context={context}
-      request={next}
-      onSubmitPin={async (pin) => {
-        settleDialogLocally(next.requestID)
-        await rpc.submit({ requestID: next.requestID, pin }, { location: targetLocation() }).catch((err) => {
-          context.ui.toast.show({
-            title: "YubiKey PIN Error",
-            message: formatError(err),
-            variant: "error",
-          })
+  return createComponent(PinentryModal, {
+    context,
+    request: next,
+    onSubmitPin: async (pin) => {
+      settleDialogLocally(next.requestID)
+      await rpc.submit({ requestID: next.requestID, pin }, { location: targetLocation() }).catch((err) => {
+        context.ui.toast.show({
+          title: "YubiKey PIN Error",
+          message: formatError(err),
+          variant: "error",
         })
-      }}
-      onCancel={handleCancel}
-    />
-  )
+      })
+    },
+    onCancel: handleCancel,
+  })
 }
 
 interface TuiCommandActions {
@@ -787,18 +780,16 @@ export default Plugin.define({
 
     const disposeFooterSlot = context.ui.slot({
       append: "prompt.footer.status",
-      render: () => (
-        <Show when={pendingQueue().length > 0}>
-          <text
-            fg={context.theme.text.feedback.warning.base}
-            onMouseUp={() => openNextModal()}
-          >
-            {pendingQueue()[0]?.kind === "touch"
-              ? "👆 Touch YubiKey required"
-              : "🔑 YubiKey PIN required"}
-          </text>
-        </Show>
-      ),
+      render: () =>
+        show(
+          () => pendingQueue().length > 0,
+          () =>
+            h(
+              "text",
+              { fg: context.theme.text.feedback.warning.base, onMouseUp: () => openNextModal() },
+              () => (pendingQueue()[0]?.kind === "touch" ? "👆 Touch YubiKey required" : "🔑 YubiKey PIN required"),
+            ),
+        ),
     })
 
     return () => {
