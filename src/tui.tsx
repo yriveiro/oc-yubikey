@@ -3,7 +3,7 @@ import { Plugin } from "@opencode/plugin/tui"
 import type { Context, KeymapCommand, LocationRef, RpcClient } from "@opencode/plugin/tui/context"
 import { type KeyEvent, TextAttributes } from "@opentui/core"
 import { Show, createSignal, onCleanup, onMount } from "solid-js"
-import { Pinentry, type RequestSummary } from "./rpc.js"
+import { Pinentry, type RequestSummary } from "./rpc.ts"
 
 const MAX_TUI_PIN_LENGTH = 128
 

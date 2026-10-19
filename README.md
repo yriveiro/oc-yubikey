@@ -35,9 +35,11 @@ When an OpenCode agent or shell command runs `git pull`, `git push`, `ssh`, `git
    ```jsonc
    {
      "$schema": "https://opencode.ai/config.json",
-     "plugin": ["/path/to/oc-yubikey"]
+     "plugins": ["github:yriveiro/oc-yubikey"]
    }
    ```
+
+   A local checkout path (for example `"/path/to/oc-yubikey"`) also works during development.
 
 2. **(Optional) Configure `~/.gnupg/gpg-agent.conf` for GnuPG touch & PIN fallback:**
 
@@ -299,6 +301,7 @@ macOS's built-in `/usr/bin/ssh-agent` (`com.apple.launchd.*/Listeners`) ships `/
 - **`gpg-agent rejected loopback pinentry mode`**: Add `allow-loopback-pinentry` to `~/.gnupg/gpg-agent.conf` and run `gpg-connect-agent reloadagent /bye`.
 - **Touch modal does not appear during `gpg --sign` outside OpenCode's shell**: Ensure `pinentry-program /path/to/oc-yubikey/bin/oc-yubikey` is set in `~/.gnupg/gpg-agent.conf` and reload `gpg-agent`.
 - **YubiKey not detected (`connected: false`)**: Verify `gpg --card-status` succeeds in your terminal and that no other process holds an exclusive PC/SC lock on the smartcard reader.
+- **TUI toast `Plugin failed: github:yriveiro/oc-yubikey`**: Refresh the installed copy from the `/plugins` dialog, or remove `~/.cache/opencode/npm/git-oc-yubikey-*` so OpenCode reinstalls it. Earlier revisions declared the OpenTUI peers optional, so `@opentui/solid` was never installed beside the plugin and the TUI entry failed to load with `Cannot find package '@opentui/solid'`; the peers are now required so the JSX runtime resolves from `node_modules`.
 
 ### Development & Verification
 

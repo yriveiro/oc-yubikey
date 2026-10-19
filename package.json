@@ -36,15 +36,6 @@
   "peerDependenciesMeta": {
     "@opencode/theme": {
       "optional": true
-    },
-    "@opentui/core": {
-      "optional": true
-    },
-    "@opentui/solid": {
-      "optional": true
-    },
-    "solid-js": {
-      "optional": true
     }
   }
 }
