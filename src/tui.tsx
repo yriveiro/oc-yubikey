@@ -1,3 +1,4 @@
+/** @jsxImportSource @opentui/solid */
 import { Plugin } from "@opencode/plugin/tui"
 import type { Context, KeymapCommand, LocationRef, RpcClient } from "@opencode/plugin/tui/context"
 import { type KeyEvent, TextAttributes } from "@opentui/core"

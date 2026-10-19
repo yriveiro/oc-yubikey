@@ -19,6 +19,7 @@
     "rpc.ts",
     "bin",
     "src",
+    "tsconfig.json",
     "README.md"
   ],
   "scripts": {
