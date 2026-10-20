@@ -32,8 +32,14 @@ import {
   type ResolutionOutcome,
   type ResolvedEvent,
   type YubiKeyCardStatus,
+  type YubiKeyPinPolicy,
 } from "./rpc.ts"
-import { checkGpgAgentReady, getYubiKeyCardStatus, lockYubiKey } from "./yubikey.ts"
+import {
+  checkGpgAgentReady,
+  formatCardStatusReport,
+  getYubiKeyCardStatus,
+  lockYubiKey,
+} from "./yubikey.ts"
 
 export {
   type AskpassClassification,
@@ -49,44 +55,18 @@ export {
   type ResolvedEvent,
   type SshFingerprint,
   type SshKeyType,
+  type YubiKeyCardStatus,
+  type YubiKeyPinPolicy,
   classifyAskpassPrompt,
   filterSshAgentIdentitiesAnswer,
   findSshSecurityKeyFile,
+  formatCardStatusReport,
   formatFriendlySshKeyType,
   isAppleAgentSocket,
   isAppleLaunchdSshAgentSocket,
   parseSshAgentSignRequest,
   resolvePinentryCliPath,
   sanitizeDisplayText,
-}
-
-export function formatCardStatusReport(
-  gpgAgentReady: boolean,
-  card: YubiKeyCardStatus,
-): string {
-  if (!card.connected) {
-    return `gpg-agent ready: ${gpgAgentReady ? "yes" : "no"}\nYubiKey OpenPGP card: not connected`
-  }
-
-  const retries = card.pinRetries
-    ? `[${card.pinRetries.user} ${card.pinRetries.reset} ${card.pinRetries.admin}] (user=${card.pinRetries.user}, reset=${card.pinRetries.reset}, admin=${card.pinRetries.admin})`
-    : "unknown"
-
-  const uifText = card.uif
-    ? `Sign=${card.uif.sign} Decrypt=${card.uif.decrypt} Auth=${card.uif.auth}`
-    : "unknown"
-
-  return [
-    "YubiKey OpenPGP Card: connected",
-    `Reader: ${card.reader ?? "unknown"}`,
-    `Serial: ${card.serial ?? "unknown"}`,
-    `Application ID: ${card.applicationID ?? "unknown"}`,
-    `Holder: ${card.holder ?? "not set"}`,
-    `Signature Counter: ${card.signatureCount ?? 0}`,
-    `PIN Retry Counters: ${retries}`,
-    `Touch Policy (UIF): ${uifText}`,
-    `gpg-agent Ready: ${gpgAgentReady ? "yes" : "no"}`,
-  ].join("\n")
 }
 
 const EMPTY_OBJECT_SCHEMA = {
@@ -116,7 +96,7 @@ function registerStatusAndLockTools(
     name: "yubikey_status",
     options: { codemode: false },
     description:
-      "Check connected YubiKey OpenPGP smartcard status (serial, holder, signature counter, PIN retry counters, UIF touch policy) and gpg-agent readiness.",
+      "Check connected YubiKey OpenPGP smartcard status (serial, holder, signature counter, signature PIN policy, PIN retry counters, UIF touch policy) and gpg-agent readiness.",
     input: EMPTY_OBJECT_SCHEMA,
     execute: async (_input, context) => {
       await context.progress({ status: "Checking YubiKey and gpg-agent status" })
@@ -236,7 +216,10 @@ export default Plugin.define({
       onResolved: (event) => emitResolved?.(event),
     })
 
-    const bridge = new PinentryBridge({ coordinator })
+    const bridge = new PinentryBridge({
+      coordinator,
+      getCardStatus: () => getYubiKeyCardStatus(),
+    })
     await bridge.start()
 
     const rpcRegistration = await ctx.rpc.register(

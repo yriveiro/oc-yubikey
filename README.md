@@ -21,7 +21,7 @@
 
 ## Level 1 — Overview & Quick Start
 
-When an OpenCode agent or shell command runs `git pull`, `git push`, `ssh`, `git commit -S`, or `git tag -s` with a hardware-backed YubiKey (FIDO2 `sk-ssh-ed25519@openssh.com` / `sk-ecdsa-sha2-nistp256@openssh.com` or OpenPGP smartcard), the command normally blocks waiting for either a PIN or a physical touch on the YubiKey contact sensor. Without a TUI prompt, terminal sessions appear frozen or pop up external GUI windows behind the terminal.
+Hardware-backed YubiKey commands (`git pull`, `git push`, `ssh`, `git commit -S`, `git tag -s`) use FIDO2 (`sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`) or OpenPGP keys. Each command blocks on a PIN or a physical touch on the YubiKey contact sensor. Without a TUI prompt, terminal sessions appear frozen or pop up external GUI windows behind the terminal.
 
 `oc-yubikey` solves both problems directly inside OpenCode:
 
@@ -78,8 +78,18 @@ Every shell command spawned by OpenCode passes through `oc-yubikey`'s `shell.hoo
 | :--- | :--- | :--- |
 | `/yubikey` or `/yubikey unlock [reason]` | `/pinentry`, `/yk` | Open the PIN modal and unlock the YubiKey OpenPGP card in `gpg-agent` |
 | `/yubikey touch [reason]` | `/yk touch` | Trigger a real FIDO2 hardware touch challenge (`ssh-keygen -Y sign`), play sound notification, and auto-dismiss on physical YubiKey touch |
-| `/yubikey status` | `/yk info` | Show a toast with card serial, holder, signature counter, PIN retries, and UIF touch policy |
+| `/yubikey status` | `/yk info` | Show a toast with card serial, holder, signature counter, PIN policy, PIN retries, and UIF touch policy |
 | `/yubikey lock` | `/yk reset` | Clear the cached PIN (`SCD RESET` + `RELOADAGENT`) |
+
+### OpenPGP Card States & PIN Behavior
+
+An OpenPGP smartcard always defines a user PIN (`PW1`) and a retry counter in DO `0xC4`. The plugin reads the card before prompting for three states:
+
+| User Scenario | Hardware Card State | Observable Signals | Plugin Behavior |
+| :--- | :--- | :--- | :--- |
+| PIN is blocked | `PW1` error counter is `0` | `pinRetries.user === 0` | Refuses to prompt and reports that the user PIN is blocked |
+| Applet never personalized | Factory state (`PW1` = `123456`, empty reset code) | `pinRetries.reset === 0`, no `holder`, no `keys` | Refuses `unlock()` without prompting and disables retries |
+| Card has no OpenPGP keys | Applet initialized without keys | `keys === undefined` | Refuses `unlock()` before opening `PinentryModal` |
 
 ### Modal Keyboard Shortcuts
 
@@ -95,7 +105,7 @@ Every shell command spawned by OpenCode passes through `oc-yubikey`'s `shell.hoo
 
 All four tools are registered with `options: { codemode: false }` so the LLM must invoke them as explicit top-level tool calls:
 
-- **`yubikey_status`**: Inspects `gpg-agent` readiness and `gpg --card-status` metadata (reader, serial, Application ID, holder, signature count, PIN retry counters `[user reset admin]`, and UIF touch policy).
+- **`yubikey_status`**: Inspects `gpg-agent` readiness and `gpg --card-status` metadata (reader, serial, Application ID, holder, signature count, signature PIN policy `once` / `always`, PIN retry counters `[user reset admin]`, and UIF touch policy).
 - **`yubikey_unlock`**: Opens the TUI `PinentryModal` and verifies the user's PIN directly against `gpg-agent` (`OPTION pinentry-mode=loopback` → `SCD SERIALNO` → `SCD CHECKPIN <aid>`). The PIN is never returned to the LLM.
 - **`yubikey_touch`**: Triggers a hardware FIDO2 user-presence challenge (`ssh-keygen -Y sign` against `~/.ssh/id_*_sk`), opens `TouchModal` in the TUI, and resolves automatically when the user physically touches the YubiKey.
 - **`yubikey_lock`**: Clears cached PIN state in `scdaemon` and reloads `gpg-agent` (`SCD RESET` + `RELOADAGENT`).
@@ -252,7 +262,7 @@ stateDiagram-v2
 | **Per-Instance 256-bit IPC Token Auth** | `PinentryBridge` generates a 32-byte cryptographic token (`randomBytes(32).toString("hex")`) per instance and verifies every IPC connection using `crypto.timingSafeEqual`. Unauthenticated local sockets are rejected before reaching `PinentryCoordinator`. |
 | **Socket & Directory Ownership Verification** | `/tmp/oc-yk-<uid>` (`0700`), `ipc-<id>.sock` (`0600`), `active.json` (`0600`), and upstream `gpg-agent` / `SSH_AUTH_SOCK` paths are verified via `lstatSync` to reject symlinks, non-sockets, foreign UIDs, and group/world permissions (`mode & 0o077`). |
 | **Atomic Pointer Updates** | `active.json` is written via an exclusive temporary file (`flag: "wx"`, `mode: 0o600`) and atomically renamed into place, then removed on `bridge.close()`. |
-| **PIN Retry Lockout Guard** | `PinentryCoordinator.unlock()` checks the card's remaining user PIN retry counter before and after every attempt and refuses to automatically re-prompt when `pinRetries.user <= 1`, preventing accidental depletion of the final hardware attempt. |
+| **PIN Retry Lockout Guard** | `PinentryCoordinator.unlock()` refuses to prompt when the card has no OpenPGP keys or when `pinRetries.user <= 0`, and stops automatic retries when `pinRetries.user <= 1`, when retry counters are unreadable, or when the applet is unpersonalized. |
 | **Assuan & Display Sanitization** | Assuan commands reject `\r`, `\n`, and `\0`, validate `aid`/`keygrip` against `/^[0-9A-Fa-f]{16,64}$/`, zero temporary `Buffer` instances (`pinBuf.fill(0)`), and strip ANSI/OSC control characters and Unicode bidirectional overrides (`sanitizeDisplayText`) before rendering in the TUI. |
 | **Trusted Executable Resolution** | Child processes (`gpg`, `gpgconf`, `gpg-connect-agent`, fallback `pinentry-mac`) are resolved against root/user-owned non-world-writable system directories (`/opt/homebrew/bin`, `/usr/local/MacGPG2/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`) with recursion guards (`OC_YUBIKEY_FALLBACK_ACTIVE=1`). |
 | **Bounded Buffers & Queues** | Enforces strict caps on IPC payloads (`64 KB`), SSH agent frames (`256 KB`), Assuan lines (`16 KB`–`64 KB`), child stdout/stderr (`256 KB`), and TUI PIN input (`128` characters). |
@@ -292,9 +302,9 @@ stateDiagram-v2
 
 ### macOS Apple `launchd` `ssh-agent` vs. Homebrew OpenSSH (`-sk` Keys)
 
-macOS's built-in `/usr/bin/ssh-agent` (`com.apple.launchd.*/Listeners`) ships `/usr/libexec/ssh-sk-helper` compiled **without** `libfido2` (`internal security key support not enabled`). When an `sk-ssh-ed25519@openssh.com` or `sk-ecdsa-*` key is loaded into Apple's agent without `SSH_SK_PROVIDER`, signing via the agent fails and prevents Homebrew OpenSSH (`/opt/homebrew/bin/ssh`) from falling back to the local `~/.ssh/id_*_sk` file.
+macOS's built-in `/usr/bin/ssh-agent` (`com.apple.launchd.*/Listeners`) ships `/usr/libexec/ssh-sk-helper` compiled **without** `libfido2` (`internal security key support not enabled`). Loading an `sk-ssh-ed25519@openssh.com` or `sk-ecdsa-*` key into Apple's agent without `SSH_SK_PROVIDER` breaks agent signing. That failure also stops Homebrew OpenSSH (`/opt/homebrew/bin/ssh`) from using the local `~/.ssh/id_*_sk` file.
 
-`PinentryBridge` automatically detects when it is proxying an Apple `launchd` `ssh-agent` socket without `SSH_SK_PROVIDER` and filters `sk-*` identities out of `SSH2_AGENT_IDENTITIES_ANSWER` (message `12`). Homebrew OpenSSH then uses the local `~/.ssh/id_*_sk` key with Homebrew's `ssh-sk-helper` and triggers `bin/oc-yubikey` via `SSH_ASKPASS=force`, displaying the OpenCode `TouchModal` and dismissing it as soon as you touch the YubiKey.
+`PinentryBridge` detects when it proxies an Apple `launchd` `ssh-agent` socket without `SSH_SK_PROVIDER` and filters `sk-*` identities out of `SSH2_AGENT_IDENTITIES_ANSWER` (message `12`). Homebrew OpenSSH then uses `~/.ssh/id_*_sk` with Homebrew's `ssh-sk-helper` and `bin/oc-yubikey` (`SSH_ASKPASS=force`), which opens `TouchModal` until you touch the YubiKey.
 
 ### Troubleshooting
 
@@ -305,7 +315,7 @@ macOS's built-in `/usr/bin/ssh-agent` (`com.apple.launchd.*/Listeners`) ships `/
 
 ### Development & Verification
 
-This repository uses **TypeScript 6.0+** with strict type-level invariants (`verbatimModuleSyntax`, `noImplicitOverride`, `allowImportingTsExtensions`, compile-time `Expect<Equal<...>>` checks) and runs natively on **Bun** and **Node 24+**.
+This repository uses **TypeScript 6.0+** (`verbatimModuleSyntax`, `noImplicitOverride`, `allowImportingTsExtensions`, compile-time `Expect<Equal<...>>` checks). It runs natively on **Bun** and **Node 24+**.
 
 ```bash
 # Type-check with TypeScript 6.0+

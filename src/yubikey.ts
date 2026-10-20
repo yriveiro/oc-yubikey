@@ -9,7 +9,7 @@ import {
   encodeAssuanData,
   parseAssuanData,
 } from "./protocol.ts"
-import type { YubiKeyCardStatus } from "./rpc.ts"
+import type { YubiKeyCardStatus, YubiKeyPinPolicy } from "./rpc.ts"
 
 export { assuanPercentDecode, assuanPercentEncode, encodeAssuanData, parseAssuanData }
 
@@ -667,6 +667,7 @@ interface MutableCardStatus {
   version?: string
   holder?: string
   signatureCount?: number
+  pinPolicy?: YubiKeyPinPolicy
   pinRetries?: { user: number; reset: number; admin: number }
   uif?: { sign: string; decrypt: string; auth: string }
   sigKey?: string
@@ -679,10 +680,21 @@ function parsePinRetriesTriple(
 ): { user: number; reset: number; admin: number } | undefined {
   const parts = raw
     .trim()
-    .split(/\s+/)
+    .split(/[\s:]+/)
     .map((n) => Number.parseInt(n, 10))
-  if (parts.length < 3 || parts.some((n) => Number.isNaN(n))) return undefined
+  if (parts.length < 3 || parts.slice(0, 3).some((n) => Number.isNaN(n))) return undefined
   return { user: parts[0], reset: parts[1], admin: parts[2] }
+}
+
+const PIN_POLICY_VALUES: Readonly<Record<string, YubiKeyPinPolicy>> = {
+  "0": "once",
+  "1": "always",
+  "not forced": "once",
+  forced: "always",
+}
+
+function parsePinPolicy(raw: string | undefined): YubiKeyPinPolicy | undefined {
+  return raw ? PIN_POLICY_VALUES[raw.trim().toLowerCase()] : undefined
 }
 
 function parseUifValue(raw: string): { sign: string; decrypt: string; auth: string } | undefined {
@@ -697,8 +709,70 @@ function parseUifValue(raw: string): { sign: string; decrypt: string; auth: stri
   }
 }
 
+function normalizeColonUifFlag(raw: string | undefined): string | undefined {
+  if (!raw) return undefined
+  const val = raw.trim().toLowerCase()
+  if (val === "0" || val === "off") return "off"
+  if (val === "1" || val === "2" || val === "on" || val === "permanent") return "on"
+  return undefined
+}
+
+function parseColonUif(
+  cols: readonly string[],
+): { sign: string; decrypt: string; auth: string } | undefined {
+  const sign = normalizeColonUifFlag(cols[1])
+  const decrypt = normalizeColonUifFlag(cols[2])
+  const auth = normalizeColonUifFlag(cols[3])
+  if (!sign && !decrypt && !auth) return undefined
+  return {
+    sign: sign ?? "off",
+    decrypt: decrypt ?? "off",
+    auth: auth ?? "off",
+  }
+}
+
+function formatColonVersion(raw: string): string {
+  const trimmed = raw.trim()
+  if (/^\d{4}$/.test(trimmed)) {
+    const major = Number.parseInt(trimmed.slice(0, 2), 10)
+    const minor = Number.parseInt(trimmed.slice(2, 4), 10)
+    return `${major}.${minor}`
+  }
+  return trimmed
+}
+
 function normalizeHolderName(raw: string): string {
   return raw.replace(/<+/g, " ").trim()
+}
+
+function parseColonHolder(cols: readonly string[]): string | undefined {
+  const joined = [cols[1], cols[2]]
+    .filter((part): part is string => Boolean(part))
+    .map(normalizeHolderName)
+    .join(" ")
+    .trim()
+  return joined || undefined
+}
+
+function parseColonVendor(cols: readonly string[]): string | undefined {
+  const name = cols[2] ? parseAssuanData(cols[2]).trim() : ""
+  return name && name !== "?" ? name : undefined
+}
+
+function parseOptionalInt(raw: string | undefined): number | undefined {
+  const parsed = Number.parseInt(raw ?? "", 10)
+  return Number.isNaN(parsed) ? undefined : parsed
+}
+
+function applyColonReader(state: MutableCardStatus, cols: readonly string[]): void {
+  if (cols[1]) state.reader ??= cols[1]
+  if (cols[2]?.toLowerCase() === "aid" && cols[3]) state.applicationID ??= cols[3]
+}
+
+function applyColonFpr(state: MutableCardStatus, cols: readonly string[]): void {
+  state.sigKey ??= cols[1] || undefined
+  state.encKey ??= cols[2] || undefined
+  state.authKey ??= cols[3] || undefined
 }
 
 const HUMAN_CARD_FIELD_HANDLERS: Readonly<
@@ -722,6 +796,9 @@ const HUMAN_CARD_FIELD_HANDLERS: Readonly<
   "name of cardholder": (s, v) => {
     s.holder = normalizeHolderName(v)
   },
+  "signature pin": (s, v) => {
+    s.pinPolicy = parsePinPolicy(v) ?? s.pinPolicy
+  },
   "pin retry counter": (s, v) => {
     s.pinRetries = parsePinRetriesTriple(v) ?? s.pinRetries
   },
@@ -729,8 +806,7 @@ const HUMAN_CARD_FIELD_HANDLERS: Readonly<
     s.uif = parseUifValue(v) ?? s.uif
   },
   "signature counter": (s, v) => {
-    const parsed = Number.parseInt(v, 10)
-    if (!Number.isNaN(parsed)) s.signatureCount = parsed
+    s.signatureCount = parseOptionalInt(v) ?? s.signatureCount
   },
   "signature key": (s, v) => {
     s.sigKey = v.replace(/\s+/g, "")
@@ -744,42 +820,31 @@ const HUMAN_CARD_FIELD_HANDLERS: Readonly<
 }
 
 const COLON_CARD_FIELD_HANDLERS: Readonly<
-  Record<string, (state: MutableCardStatus, first: string) => void>
+  Record<string, (state: MutableCardStatus, cols: readonly string[]) => void>
 > = {
-  reader: (s, v) => {
-    s.reader ??= v
-  },
-  aid: (s, v) => {
-    s.applicationID ??= v
-  },
-  serial: (s, v) => {
-    s.serial ??= v
-  },
-  "disp-name": (s, v) => {
-    s.holder ??= normalizeHolderName(v)
-  },
-  pinretry: (s, v) => {
-    s.pinRetries ??= parsePinRetriesTriple(v)
-  },
-  sigcnt: (s, v) => {
-    const parsed = Number.parseInt(v, 10)
-    if (!Number.isNaN(parsed)) s.signatureCount ??= parsed
-  },
+  reader: applyColonReader,
+  aid: (s, cols) => { s.applicationID ??= cols[1] || undefined },
+  version: (s, cols) => { if (cols[1]) s.version ??= formatColonVersion(cols[1]) },
+  vendor: (s, cols) => { s.model ??= parseColonVendor(cols) },
+  serial: (s, cols) => { s.serial ??= cols[1] || undefined },
+  name: (s, cols) => { s.holder ??= parseColonHolder(cols) },
+  "disp-name": (s, cols) => { s.holder ??= parseColonHolder([cols[0] ?? "", cols[1] ?? ""]) },
+  forcepin: (s, cols) => { s.pinPolicy ??= parsePinPolicy(cols[1]) },
+  pinretry: (s, cols) => { s.pinRetries ??= parsePinRetriesTriple(cols.slice(1, 4).join(" ")) },
+  sigcount: (s, cols) => { s.signatureCount ??= parseOptionalInt(cols[1]) },
+  sigcnt: (s, cols) => { s.signatureCount ??= parseOptionalInt(cols[1]) },
+  uif: (s, cols) => { s.uif ??= parseColonUif(cols) },
+  fpr: applyColonFpr,
+}
+
+function isColonCardLine(line: string): boolean {
+  return /^[A-Za-z0-9_-]+:/.test(line) && (line.endsWith(":") || !line.includes(": "))
 }
 
 function applyColonCardLine(state: MutableCardStatus, cols: readonly string[]): void {
   const tag = cols[0]?.toLowerCase()
   if (!tag) return
-  if (tag === "fpr") {
-    state.sigKey ??= cols[1] || undefined
-    state.encKey ??= cols[2] || undefined
-    state.authKey ??= cols[3] || undefined
-    return
-  }
-  const first = cols[1]
-  if (first) {
-    COLON_CARD_FIELD_HANDLERS[tag]?.(state, first)
-  }
+  COLON_CARD_FIELD_HANDLERS[tag]?.(state, cols)
 }
 
 export function parseCardStatusOutput(raw: string): YubiKeyCardStatus {
@@ -793,6 +858,10 @@ export function parseCardStatusOutput(raw: string): YubiKeyCardStatus {
   const state: MutableCardStatus = {}
 
   for (const line of lines) {
+    if (isColonCardLine(line)) {
+      applyColonCardLine(state, line.split(":"))
+      continue
+    }
     const kvMatch = line.match(/^([A-Za-z ]+?)\s*\.*:\s*(.+)$/)
     if (kvMatch) {
       const key = kvMatch[1].trim().toLowerCase()
@@ -833,10 +902,45 @@ export function parseCardStatusOutput(raw: string): YubiKeyCardStatus {
     ...(state.version !== undefined ? { version: state.version } : {}),
     ...(state.holder !== undefined ? { holder: state.holder } : {}),
     ...(state.signatureCount !== undefined ? { signatureCount: state.signatureCount } : {}),
+    ...(state.pinPolicy !== undefined ? { pinPolicy: state.pinPolicy } : {}),
     ...(state.pinRetries !== undefined ? { pinRetries: state.pinRetries } : {}),
     ...(state.uif !== undefined ? { uif: state.uif } : {}),
     ...(keys !== undefined ? { keys } : {}),
   }
+}
+
+export function formatCardStatusReport(
+  gpgAgentReady: boolean,
+  card: YubiKeyCardStatus,
+): string {
+  if (!card.connected) {
+    return `gpg-agent ready: ${gpgAgentReady ? "yes" : "no"}\nYubiKey OpenPGP card: not connected`
+  }
+
+  const pinPolicyText = card.pinPolicy
+    ? `${card.pinPolicy} (${card.pinPolicy === "once" ? "not forced" : "forced"})`
+    : "unknown"
+
+  const retries = card.pinRetries
+    ? `[${card.pinRetries.user} ${card.pinRetries.reset} ${card.pinRetries.admin}] (user=${card.pinRetries.user}, reset=${card.pinRetries.reset}, admin=${card.pinRetries.admin})`
+    : "unknown"
+
+  const uifText = card.uif
+    ? `Sign=${card.uif.sign} Decrypt=${card.uif.decrypt} Auth=${card.uif.auth}`
+    : "unknown"
+
+  return [
+    "YubiKey OpenPGP Card: connected",
+    `Reader: ${card.reader ?? "unknown"}`,
+    `Serial: ${card.serial ?? "unknown"}`,
+    `Application ID: ${card.applicationID ?? "unknown"}`,
+    `Holder: ${card.holder ?? "not set"}`,
+    `Signature Counter: ${card.signatureCount ?? 0}`,
+    `Signature PIN Policy: ${pinPolicyText}`,
+    `PIN Retry Counters: ${retries}`,
+    `Touch Policy (UIF): ${uifText}`,
+    `gpg-agent Ready: ${gpgAgentReady ? "yes" : "no"}`,
+  ].join("\n")
 }
 
 export async function getYubiKeyCardStatus(options?: {

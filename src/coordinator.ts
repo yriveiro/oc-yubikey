@@ -84,6 +84,9 @@ function buildSanitizedSummary<const K extends RequestKind>(
       extra[key] = clean
     }
   }
+  if (input.pinPolicy === "once" || input.pinPolicy === "always") {
+    extra.pinPolicy = input.pinPolicy
+  }
   if (input.retriesLeft !== undefined) {
     extra.retriesLeft = input.retriesLeft
   }
@@ -97,12 +100,41 @@ function buildSanitizedSummary<const K extends RequestKind>(
   }
 }
 
-function formatUnlockReason(card: YubiKeyCardStatus, reason?: string): string {
-  if (reason) return reason
-  if (card.connected) {
-    return `Unlock YubiKey OpenPGP card${card.serial ? ` (${card.serial})` : ""}`
+export function hasOpenPgpKeys(card: YubiKeyCardStatus): boolean {
+  return Boolean(card.keys?.signature || card.keys?.encryption || card.keys?.authentication)
+}
+
+export function isUnpersonalizedOpenPgpCard(card: YubiKeyCardStatus): boolean {
+  return card.connected && !card.holder && card.pinRetries?.reset === 0
+}
+
+function checkCardUnlockRefusal(card: YubiKeyCardStatus): string | undefined {
+  if (!card.connected) {
+    return "No YubiKey OpenPGP smartcard detected."
   }
-  return "Enter your YubiKey OpenPGP PIN to unlock gpg-agent"
+  const retriesLeft = card.pinRetries?.user
+  if (retriesLeft !== undefined && retriesLeft <= 0) {
+    return "YubiKey OpenPGP user PIN is blocked (0 retries remaining). Use Admin PIN / Reset Code."
+  }
+  if (!hasOpenPgpKeys(card)) {
+    if (isUnpersonalizedOpenPgpCard(card)) {
+      return "YubiKey OpenPGP applet is not personalized and has no keys loaded (factory default user PIN is 123456). Generate or import OpenPGP keys before unlocking."
+    }
+    return "YubiKey OpenPGP card has no keys loaded. Generate or import OpenPGP keys before unlocking."
+  }
+  return undefined
+}
+
+function formatUnlockReason(card: YubiKeyCardStatus, reason?: string): string {
+  const base =
+    reason ||
+    (card.connected
+      ? `Unlock YubiKey OpenPGP card${card.serial ? ` (${card.serial})` : ""}`
+      : "Enter your YubiKey OpenPGP PIN to unlock gpg-agent")
+  if (isUnpersonalizedOpenPgpCard(card)) {
+    return `${base} — applet not personalized (default PIN: 123456)`
+  }
+  return base
 }
 
 function canRetryAfterFailure(
@@ -115,7 +147,7 @@ function canRetryAfterFailure(
   if (!verifyRes.badPin || !allowRetry || attempt >= maxAttempts) {
     return false
   }
-  return updatedRetries === undefined || updatedRetries > 1
+  return updatedRetries !== undefined && updatedRetries > 1
 }
 
 export class PinentryCoordinator {
@@ -263,6 +295,7 @@ export class PinentryCoordinator {
         error: effectiveError,
         serial: card.serial,
         holder: card.holder,
+        pinPolicy: card.pinPolicy,
         retriesLeft: card.pinRetries?.user,
       },
       { signal },
@@ -287,7 +320,12 @@ export class PinentryCoordinator {
     const readCard = this.callbacks.getCardStatus ?? getYubiKeyCardStatus
     let card = await readCard({ signal: options.signal })
 
-    const allowRetry = input.allowRetry ?? true
+    const initialRefusal = checkCardUnlockRefusal(card)
+    if (initialRefusal) {
+      return { ok: false, message: initialRefusal, card }
+    }
+
+    const allowRetry = (input.allowRetry ?? true) && !isUnpersonalizedOpenPgpCard(card)
     const maxAttempts = allowRetry ? 3 : 1
     let lastError: string | undefined
 
