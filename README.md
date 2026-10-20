@@ -35,11 +35,11 @@ Hardware-backed YubiKey commands (`git pull`, `git push`, `ssh`, `git commit -S`
    ```jsonc
    {
      "$schema": "https://opencode.ai/config.json",
-     "plugins": ["github:yriveiro/oc-yubikey"]
+     "plugins": ["github:<owner>/oc-yubikey"]
    }
    ```
 
-   A local checkout path (for example `"/path/to/oc-yubikey"`) also works during development.
+   Replace `<owner>` with the GitHub account that hosts the plugin. A local checkout path (for example `"/path/to/oc-yubikey"`) also works during development.
 
 2. **(Optional) Configure `~/.gnupg/gpg-agent.conf` for GnuPG touch & PIN fallback:**
 
@@ -311,7 +311,7 @@ macOS's built-in `/usr/bin/ssh-agent` (`com.apple.launchd.*/Listeners`) ships `/
 - **`gpg-agent rejected loopback pinentry mode`**: Add `allow-loopback-pinentry` to `~/.gnupg/gpg-agent.conf` and run `gpg-connect-agent reloadagent /bye`.
 - **Touch modal does not appear during `gpg --sign` outside OpenCode's shell**: Ensure `pinentry-program /path/to/oc-yubikey/bin/oc-yubikey` is set in `~/.gnupg/gpg-agent.conf` and reload `gpg-agent`.
 - **YubiKey not detected (`connected: false`)**: Verify `gpg --card-status` succeeds in your terminal and that no other process holds an exclusive PC/SC lock on the smartcard reader.
-- **TUI toast `Plugin failed: github:yriveiro/oc-yubikey`**: Refresh the installed copy from the `/plugins` dialog, or remove `~/.cache/opencode/npm/git-oc-yubikey-*` so OpenCode reinstalls the latest commit. `src/tui.tsx` uses `@opentui/solid`'s reconciler primitives (`createElement`, `createTextNode`, `insertNode`, `insert`, `setProp`, `effect`, `createComponent`) directly rather than raw JSX syntax so it loads cleanly from `~/.cache/opencode/npm/.../node_modules` where OpenTUI's Babel Solid transform does not run.
+- **TUI toast `Plugin failed: github:<owner>/oc-yubikey`**: Refresh the installed copy from the `/plugins` dialog, or remove `~/.cache/opencode/npm/git-oc-yubikey-*` so OpenCode reinstalls the latest commit. `src/tui.tsx` uses `@opentui/solid`'s reconciler primitives (`createElement`, `createTextNode`, `insertNode`, `insert`, `setProp`, `effect`, `createComponent`) directly rather than raw JSX syntax so it loads cleanly from `~/.cache/opencode/npm/.../node_modules` where OpenTUI's Babel Solid transform does not run.
 
 ### Development & Verification
 
