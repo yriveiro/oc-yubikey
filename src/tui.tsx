@@ -83,6 +83,10 @@ function renderCardMetaRow(theme: ThemeSurface, request: RequestSummary): JSX.El
       () => renderLabeledValue(theme, "Holder", () => request.holder ?? ""),
     ),
     show(
+      () => request.pinPolicy,
+      () => renderLabeledValue(theme, "PIN Policy", () => request.pinPolicy ?? ""),
+    ),
+    show(
       () => request.retriesLeft !== undefined,
       () =>
         h(
@@ -217,9 +221,12 @@ function PinentryModal(props: PinentryModalProps) {
   }
 
   const hasCardMeta = () =>
-    Boolean(
-      props.request.serial || props.request.holder || props.request.retriesLeft !== undefined,
-    )
+    [
+      props.request.serial,
+      props.request.holder,
+      props.request.pinPolicy,
+      props.request.retriesLeft,
+    ].some((value) => value !== undefined && value !== "")
 
   return h(
     "box",
@@ -502,10 +509,11 @@ function showStatusToast(
   const retries = card.pinRetries
     ? `[${card.pinRetries.user}/${card.pinRetries.reset}/${card.pinRetries.admin}]`
     : "n/a"
+  const pinPolicy = card.pinPolicy ? ` | PIN: ${card.pinPolicy}` : ""
   const uif = card.uif ? ` | Touch: S=${card.uif.sign}/D=${card.uif.decrypt}/A=${card.uif.auth}` : ""
   context.ui.toast.show({
     title: `🔑 YubiKey ${card.serial ?? "Connected"}`,
-    message: `Holder: ${card.holder || "unset"} | Sigs: ${card.signatureCount ?? 0} | Retries: ${retries}${uif}`,
+    message: `Holder: ${card.holder || "unset"} | Sigs: ${card.signatureCount ?? 0}${pinPolicy} | Retries: ${retries}${uif}`,
     variant: "info",
     duration: 5000,
   })

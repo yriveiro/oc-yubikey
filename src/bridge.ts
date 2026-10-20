@@ -320,6 +320,7 @@ export class PinentryBridge {
   private readonly activePointerPath: string
   private readonly securityKeyDebounceMs: number
   private readonly hardwareAgentDebounceMs: number
+  private readonly getCardStatus?: () => Promise<YubiKeyCardStatus>
   private ipcServer?: net.Server
   private readonly sshProxies = new Map<
     string,
@@ -342,6 +343,7 @@ export class PinentryBridge {
     this.activePointerPath = path.join(this.socketDir, "active.json")
     this.securityKeyDebounceMs = options.securityKeyDebounceMs ?? 40
     this.hardwareAgentDebounceMs = options.hardwareAgentDebounceMs ?? 150
+    this.getCardStatus = options.getCardStatus
   }
 
   get socketPath(): string {
@@ -402,6 +404,47 @@ export class PinentryBridge {
     }
   }
 
+  private async readCardForIpcPin(msg: IpcRequestMessage): Promise<YubiKeyCardStatus | undefined> {
+    if (!this.getCardStatus || msg.keyType?.toUpperCase().endsWith("-SK")) return undefined
+    const card = await this.getCardStatus().catch(() => undefined)
+    return card?.connected ? card : undefined
+  }
+
+  private async dispatchIpcPinRequest(
+    msg: IpcRequestMessage,
+    command: string | undefined,
+    requestID: string,
+  ): Promise<IpcResponseMessage> {
+    const card = await this.readCardForIpcPin(msg)
+    const retriesLeft = card?.pinRetries?.user
+    if (!msg.keyType && retriesLeft !== undefined && retriesLeft <= 0) {
+      return { ok: false, cancelled: true }
+    }
+    const warning =
+      retriesLeft === 1
+        ? "Warning: Only 1 PIN attempt remaining before YubiKey PIN is blocked!"
+        : undefined
+    const res = await this.coordinator.requestPin(
+      {
+        title: msg.title || "YubiKey PIN Entry",
+        description: msg.description,
+        prompt: msg.prompt || "PIN:",
+        error: msg.error ?? warning,
+        serial: msg.serial ?? card?.serial,
+        holder: msg.holder ?? card?.holder,
+        pinPolicy: card?.pinPolicy,
+        retriesLeft,
+        command,
+      },
+      { requestID },
+    )
+    return {
+      ok: !res.cancelled && Boolean(res.pin),
+      cancelled: res.cancelled,
+      ...(res.pin !== undefined ? { pin: res.pin } : {}),
+    }
+  }
+
   private async dispatchIpcRequest(
     msg: IpcRequestMessage,
     requestID: string,
@@ -432,24 +475,7 @@ export class PinentryBridge {
         confirmed: res.confirmed,
       }
     }
-
-    const res = await this.coordinator.requestPin(
-      {
-        title: msg.title || "YubiKey PIN Entry",
-        description: msg.description,
-        prompt: msg.prompt || "PIN:",
-        error: msg.error,
-        serial: msg.serial,
-        holder: msg.holder,
-        command,
-      },
-      { requestID },
-    )
-    return {
-      ok: !res.cancelled && Boolean(res.pin),
-      cancelled: res.cancelled,
-      ...(res.pin !== undefined ? { pin: res.pin } : {}),
-    }
+    return this.dispatchIpcPinRequest(msg, command, requestID)
   }
 
   private handleIpcConnection(socket: net.Socket): void {

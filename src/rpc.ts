@@ -16,6 +16,8 @@ export type RequestKind = "pin" | "touch"
 
 export type ResolutionOutcome = "submitted" | "confirmed" | "cancelled"
 
+export type YubiKeyPinPolicy = "once" | "always"
+
 export interface YubiKeyUifStatus {
   readonly sign: string
   readonly decrypt: string
@@ -31,6 +33,7 @@ export interface YubiKeyCardStatus {
   readonly version?: string
   readonly holder?: string
   readonly signatureCount?: number
+  readonly pinPolicy?: YubiKeyPinPolicy
   readonly pinRetries?: {
     readonly user: number
     readonly reset: number
@@ -53,6 +56,7 @@ export interface RequestSummary extends Readonly<Record<string, unknown>> {
   readonly error?: string
   readonly serial?: string
   readonly holder?: string
+  readonly pinPolicy?: YubiKeyPinPolicy
   readonly retriesLeft?: number
   readonly keyType?: string
   readonly fingerprint?: string
@@ -77,6 +81,7 @@ export interface PromptPinInput {
   readonly error?: string
   readonly serial?: string
   readonly holder?: string
+  readonly pinPolicy?: YubiKeyPinPolicy
   readonly retriesLeft?: number
   readonly command?: string
 }
@@ -211,6 +216,12 @@ function asBoolean(value: unknown, field: string): boolean {
   return value
 }
 
+function asOptionalPinPolicy(value: unknown, field: string): YubiKeyPinPolicy | undefined {
+  if (value === undefined || value === null) return undefined
+  if (value === "once" || value === "always") return value
+  throw new Error(`Expected "once" | "always" for ${field}`)
+}
+
 function parseCardStatus(value: unknown): YubiKeyCardStatus {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return { connected: false }
@@ -225,6 +236,7 @@ function parseCardStatus(value: unknown): YubiKeyCardStatus {
     version: asOptionalString(obj.version, "card.version"),
     holder: asOptionalString(obj.holder, "card.holder"),
     signatureCount: asOptionalNumber(obj.signatureCount, "card.signatureCount"),
+    pinPolicy: asOptionalPinPolicy(obj.pinPolicy, "card.pinPolicy"),
     pinRetries:
       typeof obj.pinRetries === "object" && obj.pinRetries !== null
         ? {
@@ -279,6 +291,7 @@ function parseRequestSummary(value: unknown): RequestSummary {
     error: asOptionalString(obj.error, "error"),
     serial: asOptionalString(obj.serial, "serial"),
     holder: asOptionalString(obj.holder, "holder"),
+    pinPolicy: asOptionalPinPolicy(obj.pinPolicy, "pinPolicy"),
     retriesLeft: asOptionalNumber(obj.retriesLeft, "retriesLeft"),
     keyType: asOptionalString(obj.keyType, "keyType"),
     fingerprint: asOptionalString(obj.fingerprint, "fingerprint"),
@@ -318,6 +331,7 @@ export const Pinentry = Rpc.define({
           error: asOptionalString(obj.error, "error"),
           serial: asOptionalString(obj.serial, "serial"),
           holder: asOptionalString(obj.holder, "holder"),
+          pinPolicy: asOptionalPinPolicy(obj.pinPolicy, "pinPolicy"),
           retriesLeft: asOptionalNumber(obj.retriesLeft, "retriesLeft"),
           command: asOptionalString(obj.command, "command"),
         }

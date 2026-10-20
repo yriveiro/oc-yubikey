@@ -27,6 +27,7 @@ import type {
 import {
   assuanPercentDecode,
   assuanPercentEncode,
+  formatCardStatusReport,
   lockYubiKey,
   parseCardStatusOutput,
   presetPassphraseInAgent,
@@ -229,7 +230,9 @@ describe("PinentryCoordinator & TUI RPC flow", () => {
           serial: "12345678",
           applicationID: "D2760001240103040006123456780000",
           holder: "Jane Doe",
-          pinRetries: { user: currentRetries, reset: 0, admin: 3 },
+          pinPolicy: "once",
+          pinRetries: { user: currentRetries, reset: 3, admin: 3 },
+          keys: { signature: "111122223333444455556666777788889999AAAA" },
         }
       },
       onRequested(summary) {
@@ -285,7 +288,9 @@ describe("PinentryCoordinator & TUI RPC flow", () => {
           serial: "12345678",
           applicationID: "D2760001240103040006123456780000",
           holder: "Jane Doe",
-          pinRetries: { user: currentRetries, reset: 0, admin: 3 },
+          pinPolicy: "once",
+          pinRetries: { user: currentRetries, reset: 3, admin: 3 },
+          keys: { signature: "111122223333444455556666777788889999AAAA" },
         }
       },
       onRequested(summary) {
@@ -305,6 +310,165 @@ describe("PinentryCoordinator & TUI RPC flow", () => {
 
       expect(unlockRes.ok).toBe(false)
       expect(requested.length).toBe(1)
+    } finally {
+      coordinator.close()
+      await mockAgent.close()
+    }
+  })
+
+  it("refuses to prompt or call SCD CHECKPIN when the card has no OpenPGP keys (factory state)", async () => {
+    const mockAgent = startMockGpgAgent({ expectedPin: "123456" })
+    await mockAgent.listen()
+
+    const requested: RequestSummary[] = []
+    const coordinator = new PinentryCoordinator({
+      requestTimeoutMs: 50,
+      agentSocketPath: mockAgent.socketPath,
+      async getCardStatus(): Promise<YubiKeyCardStatus> {
+        return {
+          connected: true,
+          reader: "Yubico YubiKey OTP FIDO CCID",
+          serial: "12345678",
+          applicationID: "D2760001240103040006123456780000",
+          model: "Yubico",
+          version: "3.4",
+          signatureCount: 0,
+          pinPolicy: "once",
+          pinRetries: { user: 2, reset: 0, admin: 3 },
+          uif: { sign: "off", decrypt: "off", auth: "off" },
+        }
+      },
+      onRequested(summary) {
+        requested.push(summary)
+      },
+    })
+
+    try {
+      const unlockRes = await coordinator.unlock({
+        reason: "Sign git commit",
+        allowRetry: true,
+      })
+
+      expect(unlockRes.ok).toBe(false)
+      expect(unlockRes.message).toContain("no keys")
+      expect(unlockRes.message).toContain("123456")
+      expect(requested).toEqual([])
+      expect(mockAgent.receivedCommands).toEqual([])
+    } finally {
+      coordinator.close()
+      await mockAgent.close()
+    }
+  })
+
+  it("refuses to prompt when a personalized card has no OpenPGP keys loaded", async () => {
+    const mockAgent = startMockGpgAgent({ expectedPin: "888888" })
+    await mockAgent.listen()
+
+    const requested: RequestSummary[] = []
+    const coordinator = new PinentryCoordinator({
+      requestTimeoutMs: 50,
+      agentSocketPath: mockAgent.socketPath,
+      async getCardStatus(): Promise<YubiKeyCardStatus> {
+        return {
+          connected: true,
+          serial: "12345678",
+          applicationID: "D2760001240103040006123456780000",
+          holder: "Jane Doe",
+          pinPolicy: "once",
+          pinRetries: { user: 3, reset: 3, admin: 3 },
+        }
+      },
+      onRequested(summary) {
+        requested.push(summary)
+      },
+    })
+
+    try {
+      const unlockRes = await coordinator.unlock({
+        reason: "Sign git commit",
+        allowRetry: true,
+      })
+
+      expect(unlockRes.ok).toBe(false)
+      expect(unlockRes.message).toBe(
+        "YubiKey OpenPGP card has no keys loaded. Generate or import OpenPGP keys before unlocking.",
+      )
+      expect(requested).toEqual([])
+      expect(mockAgent.receivedCommands).toEqual([])
+    } finally {
+      coordinator.close()
+      await mockAgent.close()
+    }
+  })
+
+  it("does not retry after a bad PIN when card retry counters cannot be read or when card is unpersonalized", async () => {
+    const mockAgent = startMockGpgAgent({ expectedPin: "123456" })
+    await mockAgent.listen()
+
+    const requested: RequestSummary[] = []
+    let callCount = 0
+
+    const coordinator = new PinentryCoordinator({
+      agentSocketPath: mockAgent.socketPath,
+      async getCardStatus(): Promise<YubiKeyCardStatus> {
+        callCount += 1
+        return {
+          connected: true,
+          serial: "12345678",
+          applicationID: "D2760001240103040006123456780000",
+          holder: "Jane Doe",
+          pinRetries: callCount === 1 ? { user: 3, reset: 3, admin: 3 } : undefined,
+          keys: { signature: "111122223333444455556666777788889999AAAA" },
+        }
+      },
+      onRequested(summary) {
+        requested.push(summary)
+        setTimeout(() => {
+          coordinator.submit(summary.requestID, "wrong-pin")
+        }, 10)
+      },
+    })
+
+    try {
+      const unlockRes = await coordinator.unlock({ allowRetry: true })
+      expect(unlockRes.ok).toBe(false)
+      expect(requested.length).toBe(1)
+
+      const unpersonalizedRequested: RequestSummary[] = []
+      const unpersonalizedCoordinator = new PinentryCoordinator({
+        agentSocketPath: mockAgent.socketPath,
+        async getCardStatus(): Promise<YubiKeyCardStatus> {
+          return {
+            connected: true,
+            serial: "12345678",
+            applicationID: "D2760001240103040006123456780000",
+            pinPolicy: "once",
+            pinRetries: { user: 2, reset: 0, admin: 3 },
+            keys: { signature: "111122223333444455556666777788889999AAAA" },
+          }
+        },
+        onRequested(summary) {
+          unpersonalizedRequested.push(summary)
+          setTimeout(() => {
+            unpersonalizedCoordinator.submit(summary.requestID, "wrong-pin")
+          }, 10)
+        },
+      })
+
+      try {
+        const unpersRes = await unpersonalizedCoordinator.unlock({
+          reason: "Sign git commit",
+          allowRetry: true,
+        })
+        expect(unpersRes.ok).toBe(false)
+        expect(unpersonalizedRequested.length).toBe(1)
+        expect(unpersonalizedRequested[0]?.description).toBe(
+          "Sign git commit — applet not personalized (default PIN: 123456)",
+        )
+        expect(unpersonalizedRequested[0]?.pinPolicy).toBe("once")
+      } finally {
+        unpersonalizedCoordinator.close()
+      }
     } finally {
       coordinator.close()
       await mockAgent.close()
@@ -343,35 +507,131 @@ describe("PinentryCoordinator & TUI RPC flow", () => {
 })
 
 describe("parseCardStatusOutput", () => {
-  it("parses human-readable and colon-delimited gpg --card-status output", () => {
-    const sample = `
+  it("parses human-readable and colon-delimited gpg --card-status output to identical YubiKeyCardStatus", () => {
+    const humanPersonalized = `
 Reader ...........: Yubico YubiKey OTP FIDO CCID
 Application ID ...: D2760001240103040006123456780000
 Application type .: OpenPGP
 Version ..........: 3.4
 Manufacturer .....: Yubico
 Serial number ....: 12345678
-Name of cardholder: Doe<<Jane
+Name of cardholder: Jane Doe
+Signature PIN ....: forced
 PIN retry counter : 3 0 3
 Signature counter : 128
 UIF setting ......: Sign=on Decrypt=off Auth=on
 Signature key ....: 1111 2222 3333 4444 5555  6666 7777 8888 9999 AAAA
 `
-    expect(parseCardStatusOutput(sample)).toEqual({
+    const colonPersonalized = `
+Reader:Yubico YubiKey OTP FIDO CCID:AID:D2760001240103040006123456780000:openpgp-card:
+version:0304:
+vendor:0006:Yubico:
+serial:12345678:
+name:Jane:Doe:
+lang::
+sex:u:
+url::
+login::
+forcepin:1:::
+keyattr:1:1:2048:
+keyattr:2:1:2048:
+keyattr:3:1:2048:
+maxpinlen:127:127:127:
+pinretry:3:0:3:
+sigcount:128:::
+kdf:off:
+uif:1:0:1:
+cafpr::::
+fpr:111122223333444455556666777788889999AAAA:::
+fprtime:1700000000:0:0:
+grp:0000000000000000000000000000000000000000:0000000000000000000000000000000000000000:0000000000000000000000000000000000000000:
+`
+    const expectedPersonalized: YubiKeyCardStatus = {
       connected: true,
       reader: "Yubico YubiKey OTP FIDO CCID",
       applicationID: "D2760001240103040006123456780000",
       serial: "12345678",
       model: "Yubico",
       version: "3.4",
-      holder: "Doe Jane",
+      holder: "Jane Doe",
+      pinPolicy: "always",
       pinRetries: { user: 3, reset: 0, admin: 3 },
       signatureCount: 128,
       uif: { sign: "on", decrypt: "off", auth: "on" },
       keys: {
         signature: "111122223333444455556666777788889999AAAA",
       },
-    })
+    }
+
+    expect(parseCardStatusOutput(humanPersonalized)).toEqual(expectedPersonalized)
+    expect(parseCardStatusOutput(colonPersonalized)).toEqual(expectedPersonalized)
+
+    const humanFactory = `
+Reader ...........: Yubico YubiKey OTP FIDO CCID
+Application ID ...: D2760001240103040006123456780000
+Application type .: OpenPGP
+Version ..........: 3.4
+Manufacturer .....: Yubico
+Serial number ....: 12345678
+Name of cardholder: [not set]
+Language prefs ...: [not set]
+Salutation .......: 
+URL of public key : [not set]
+Login data .......: [not set]
+Signature PIN ....: not forced
+Key attributes ...: rsa2048 rsa2048 rsa2048
+Max. PIN lengths .: 127 127 127
+PIN retry counter : 2 0 3
+Signature counter : 0
+KDF setting ......: off
+UIF setting ......: Sign=off Decrypt=off Auth=off
+Signature key ....: [none]
+Encryption key....: [none]
+Authentication key: [none]
+General key info..: [none]
+`
+    const colonFactory = `
+Reader:Yubico YubiKey OTP FIDO CCID:AID:D2760001240103040006123456780000:openpgp-card:
+version:0304:
+vendor:0006:Yubico:
+serial:12345678:
+name:::
+lang::
+sex:u:
+url::
+login::
+forcepin:0:::
+keyattr:1:1:2048:
+keyattr:2:1:2048:
+keyattr:3:1:2048:
+maxpinlen:127:127:127:
+pinretry:2:0:3:
+sigcount:0:::
+kdf:off:
+uif:0:0:0:
+cafpr::::
+fpr::::
+fprtime:0:0:0:
+grp:0000000000000000000000000000000000000000:0000000000000000000000000000000000000000:0000000000000000000000000000000000000000:
+`
+    const expectedFactory: YubiKeyCardStatus = {
+      connected: true,
+      reader: "Yubico YubiKey OTP FIDO CCID",
+      applicationID: "D2760001240103040006123456780000",
+      serial: "12345678",
+      model: "Yubico",
+      version: "3.4",
+      pinPolicy: "once",
+      pinRetries: { user: 2, reset: 0, admin: 3 },
+      signatureCount: 0,
+      uif: { sign: "off", decrypt: "off", auth: "off" },
+    }
+
+    expect(parseCardStatusOutput(humanFactory)).toEqual(expectedFactory)
+    expect(parseCardStatusOutput(colonFactory)).toEqual(expectedFactory)
+    expect(formatCardStatusReport(true, expectedFactory)).toContain(
+      "Signature PIN Policy: once (not forced)",
+    )
   })
 })
 
@@ -773,6 +1033,75 @@ describe("YubiKey Touch Prompt & SSH_AUTH_SOCK / SSH_ASKPASS / Pinentry Bridge",
       const syntheticSk = path.join(tmpDir, "id_ed25519_sk")
       writeFileSync(syntheticSk, "SYNTHETIC_SK_KEY", { mode: 0o600 })
       expect(findSshSecurityKeyFile(tmpDir)).toBe(syntheticSk)
+    } finally {
+      coordinator.close()
+      await bridge.close()
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it("enriches IPC PIN requests with card status via PinentryBridge.getCardStatus and fails fast when user PIN is blocked", async () => {
+    const baseTmp = existsSync("/tmp") ? "/tmp" : os.tmpdir()
+    const tmpDir = mkdtempSync(path.join(baseTmp, "oc-bridge-card-"))
+    const requested: RequestSummary[] = []
+    let userRetries = 2
+
+    const coordinator = new PinentryCoordinator({
+      onRequested(summary) {
+        requested.push(summary)
+        if (summary.kind === "pin") {
+          setTimeout(() => {
+            coordinator.submit(summary.requestID, "424242")
+          }, 15)
+        }
+      },
+    })
+
+    const bridge = new PinentryBridge({
+      coordinator,
+      socketDir: tmpDir,
+      async getCardStatus(): Promise<YubiKeyCardStatus> {
+        return {
+          connected: true,
+          serial: "12345678",
+          holder: "Jane Doe",
+          pinPolicy: "once",
+          pinRetries: { user: userRetries, reset: 3, admin: 3 },
+          keys: { signature: "111122223333444455556666777788889999AAAA" },
+        }
+      },
+    })
+    await bridge.start()
+
+    try {
+      const sendPinIpc = () =>
+        new Promise<{ ok: boolean; cancelled: boolean; pin?: string }>((resolve, reject) => {
+          const sock = net.createConnection({ path: bridge.socketPath })
+          let buf = ""
+          sock.once("connect", () => {
+            sock.write(
+              `${JSON.stringify({ type: "pin", token: bridge.token, description: "Please enter PIN" })}\n`,
+            )
+          })
+          sock.on("data", (chunk) => {
+            buf += chunk.toString("utf8")
+          })
+          sock.once("close", () => resolve(JSON.parse(buf.trim())))
+          sock.once("error", reject)
+        })
+
+      const firstReply = await sendPinIpc()
+      expect(firstReply).toEqual({ ok: true, cancelled: false, pin: "424242" })
+      expect(requested.length).toBe(1)
+      expect(requested[0]?.serial).toBe("12345678")
+      expect(requested[0]?.holder).toBe("Jane Doe")
+      expect(requested[0]?.pinPolicy).toBe("once")
+      expect(requested[0]?.retriesLeft).toBe(2)
+
+      userRetries = 0
+      const blockedReply = await sendPinIpc()
+      expect(blockedReply).toEqual({ ok: false, cancelled: true })
+      expect(requested.length).toBe(1)
     } finally {
       coordinator.close()
       await bridge.close()
