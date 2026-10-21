@@ -6,6 +6,7 @@ import {
   lstatSync,
   mkdirSync,
   readdirSync,
+  readFileSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -21,6 +22,7 @@ import {
   type SshKeyType,
   classifyAskpassPrompt,
   getRuntimeSocketDirPath,
+  parseJsonObject,
   verifySecureSocketDir,
 } from "./protocol.ts"
 import type { PromptTouchInput, PromptTouchOutput, YubiKeyCardStatus } from "./rpc.ts"
@@ -727,7 +729,8 @@ export class PinentryBridge {
 
   /**
    * Injects `SSH_AUTH_SOCK`, `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE`, `OC_YUBIKEY_SOCK`,
-   * `OC_YUBIKEY_TOKEN`, and `PINENTRY_USER_DATA` into a shell command environment before execution.
+   * `OC_YUBIKEY_TOKEN`, `PINENTRY_USER_DATA`, and `GPG_TTY=/dev/null` into a shell
+   * command environment before execution.
    */
   async prepareShellEnv(
     env: Record<string, string | undefined>,
@@ -746,6 +749,8 @@ export class PinentryBridge {
     } else {
       delete env.OC_YUBIKEY_COMMAND
     }
+
+    env.GPG_TTY = "/dev/null"
 
     const cliPath = resolvePinentryCliPath()
     if (existsSync(cliPath)) {
@@ -880,10 +885,18 @@ export class PinentryBridge {
     await Promise.allSettled(closes)
 
     rmSync(this.ipcSocketPath, { force: true })
-    rmSync(this.activePointerPath, { force: true })
+    this.removeActivePointerIfOwned()
     for (const [, entry] of this.sshProxies) {
       rmSync(entry.proxySocketPath, { force: true })
     }
     this.sshProxies.clear()
+  }
+
+  private removeActivePointerIfOwned(): void {
+    if (!existsSync(this.activePointerPath)) return
+    const parsed = parseJsonObject(readFileSync(this.activePointerPath, "utf8"))
+    if (parsed?.socketPath === this.ipcSocketPath) {
+      rmSync(this.activePointerPath, { force: true })
+    }
   }
 }
