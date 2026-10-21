@@ -41,7 +41,9 @@ Hardware-backed YubiKey commands (`git pull`, `git push`, `ssh`, `git commit -S`
 
    Replace `<owner>` with the GitHub account that hosts the plugin. A local checkout path (for example `"/path/to/oc-yubikey"`) also works during development.
 
-2. **(Optional) Configure `~/.gnupg/gpg-agent.conf` for GnuPG touch & PIN fallback:**
+2. **Configure `~/.gnupg/gpg-agent.conf` and `~/.gnupg/gpg.conf`:**
+
+   In `~/.gnupg/gpg-agent.conf`:
 
    ```ini
    allow-loopback-pinentry
@@ -49,15 +51,13 @@ Hardware-backed YubiKey commands (`git pull`, `git push`, `ssh`, `git commit -S`
    pinentry-program /path/to/oc-yubikey/bin/oc-yubikey
    ```
 
+   In `~/.gnupg/gpg.conf`, keep GnuPG's default `ask` pinentry mode and omit `pinentry-mode loopback`. `yubikey_unlock` sends `OPTION pinentry-mode=loopback` per connection over the Assuan socket. Leaving `pinentry-mode loopback` in `gpg.conf` forces `gpg` to skip `pinentry-program` and prompt on a terminal.
+
    Reload `gpg-agent` after editing:
 
    ```bash
    gpg-connect-agent reloadagent /bye
    ```
-
-   `pinentry-program` is what makes `gpg-agent` ask this plugin for the PIN instead of
-   prompting on a terminal. It has to point at the `bin/oc-yubikey` of the checkout the
-   running plugin came from. The agent keeps that path until you reload it.
 
 3. **Verify inside OpenCode:**
    Run `/yubikey status` in the TUI prompt or ask the agent to run `yubikey_status`.
@@ -214,17 +214,12 @@ sequenceDiagram
   end
 ```
 
-`gpg-agent` only launches the pinentry program when gpg asks for the passphrase in `ask`
-pinentry mode. In `loopback` mode the agent hands the inquiry back to gpg, which prompts
-on a terminal, and a shell without a tty can never answer that prompt. The plugin
-therefore puts a `gpg` wrapper first on the `PATH` of the commands it runs. The wrapper
-executes the real gpg with `--pinentry-mode ask` unless the caller asked for a mode
-itself.
-
 The shim talks to the instance that owns the running command. `gpg-agent` passes that
 instance as `PINENTRY_USER_DATA` to the pinentry program it launches, and the shim
 prefers it over the `OC_YUBIKEY_*` variables, which the agent inherited from the shell
-that started it and which can name an instance that is gone.
+that started it and which can name an instance that is gone. `prepareShellEnv()` also sets
+`GPG_TTY=/dev/null` so a non-interactive OpenCode shell never directs `gpg` or
+`pinentry-curses` to open the terminal owned by the OpenCode TUI.
 
 ### Flow 3: Direct Assuan Loopback Unlock (`yubikey_unlock`)
 
@@ -331,8 +326,8 @@ macOS's built-in `/usr/bin/ssh-agent` (`com.apple.launchd.*/Listeners`) ships `/
 
 ### Troubleshooting
 
-- **`gpg-agent rejected loopback pinentry mode`**: Add `allow-loopback-pinentry` to `~/.gnupg/gpg-agent.conf` and run `gpg-connect-agent reloadagent /bye`.
-- **`git commit -S` hangs and no PIN modal appears**: `gpg` is asking for the passphrase on a terminal that the shell does not have. The plugin puts a `gpg` wrapper first on the `PATH` of the commands it runs, so `gpg` stays in `ask` pinentry mode and `gpg-agent` asks the pinentry program, which is this plugin. Two things still break that: `gpg.program` in the git config pointing at an absolute `gpg` path, which bypasses the `PATH`, and a `pinentry-program` in `~/.gnupg/gpg-agent.conf` that points at another checkout than the running plugin. Check both when the modal stays away.
+- **`gpg-agent rejected loopback pinentry mode`**: Remove `no-allow-loopback-pinentry` (or add `allow-loopback-pinentry`) in `~/.gnupg/gpg-agent.conf` and run `gpg-connect-agent reloadagent /bye`.
+- **`git commit -S` fails or does not open the PIN modal**: Run `yubikey_status` to inspect your GnuPG configuration. Ensure `~/.gnupg/gpg.conf` does not set `pinentry-mode loopback` (which bypasses `pinentry-program`), and set `pinentry-program /path/to/oc-yubikey/bin/oc-yubikey` in `~/.gnupg/gpg-agent.conf` followed by `gpg-connect-agent reloadagent /bye`.
 - **Touch modal does not appear during `gpg --sign` outside OpenCode's shell**: Ensure `pinentry-program /path/to/oc-yubikey/bin/oc-yubikey` is set in `~/.gnupg/gpg-agent.conf` and reload `gpg-agent`.
 - **YubiKey not detected (`connected: false`)**: Verify `gpg --card-status` succeeds in your terminal and that no other process holds an exclusive PC/SC lock on the smartcard reader.
 - **TUI toast `Plugin failed: github:<owner>/oc-yubikey`**: Refresh the installed copy from the `/plugins` dialog, or remove `~/.cache/opencode/npm/git-oc-yubikey-*` so OpenCode reinstalls the latest commit. `src/tui.tsx` uses `@opentui/solid`'s reconciler primitives (`createElement`, `createTextNode`, `insertNode`, `insert`, `setProp`, `effect`, `createComponent`) directly rather than raw JSX syntax so it loads cleanly from `~/.cache/opencode/npm/.../node_modules` where OpenTUI's Babel Solid transform does not run.

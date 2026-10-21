@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test"
-import { execFileSync, spawn } from "node:child_process"
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { spawn } from "node:child_process"
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
@@ -13,7 +13,6 @@ import {
   findSshSecurityKeyFile,
   isAppleLaunchdSshAgentSocket,
   parseSshAgentSignRequest,
-  renderGpgWrapper,
   resolvePinentryCliPath,
 } from "../src/bridge.ts"
 import { PinentryCoordinator, type PromptOutputByKind } from "../src/coordinator.ts"
@@ -29,8 +28,10 @@ import {
   assuanPercentDecode,
   assuanPercentEncode,
   formatCardStatusReport,
+  inspectGpgConfiguration,
   lockYubiKey,
   parseCardStatusOutput,
+  parseGpgConfig,
   presetPassphraseInAgent,
   verifyYubiKeyPinLoopback,
 } from "../src/yubikey.ts"
@@ -1215,45 +1216,60 @@ describe("Pinentry shim target resolution", () => {
   })
 })
 
-describe("gpg wrapper", () => {
-  it("asks gpg-agent for the PIN and keeps a pinentry mode the caller chose", async () => {
-    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "oc-gpg-wrapper-test-"))
-    const fakeGpg = path.join(tmpDir, "gpg")
-    const wrapper = path.join(tmpDir, "wrapper")
-    writeFileSync(fakeGpg, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n", { mode: 0o700 })
-    writeFileSync(wrapper, renderGpgWrapper(fakeGpg), { mode: 0o700 })
+describe("GnuPG configuration and shell environment", () => {
+  it("sets GPG_TTY to /dev/null in shell environments and keeps a newer instance's active.json when an older instance closes", async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "oc-gpg-env-test-"))
+    const coordinator = new PinentryCoordinator()
+    const olderBridge = new PinentryBridge({ coordinator, socketDir: tmpDir })
+    const newerBridge = new PinentryBridge({ coordinator, socketDir: tmpDir })
 
     try {
-      const forced = execFileSync(wrapper, ["--detach-sign"]).toString().trim().split("\n")
-      expect(forced).toEqual(["--pinentry-mode", "ask", "--detach-sign"])
+      await olderBridge.start()
+      await newerBridge.start()
 
-      const chosen = execFileSync(wrapper, ["--pinentry-mode", "loopback", "--decrypt"])
-        .toString()
-        .trim()
-        .split("\n")
-      expect(chosen).toEqual(["--pinentry-mode", "loopback", "--decrypt"])
+      const env: Record<string, string | undefined> = { GPG_TTY: "/dev/ttys001" }
+      await newerBridge.prepareShellEnv(env, "git commit -S")
+      expect(env.GPG_TTY).toBe("/dev/null")
+
+      await olderBridge.close()
+      const pointer = JSON.parse(readFileSync(path.join(tmpDir, "active.json"), "utf8")) as {
+        socketPath: string
+      }
+      expect(pointer.socketPath).toBe(newerBridge.socketPath)
     } finally {
+      coordinator.close()
+      await olderBridge.close()
+      await newerBridge.close()
       rmSync(tmpDir, { recursive: true, force: true })
     }
   })
 
-  it("puts the wrapper first on the PATH of a shell command", async () => {
-    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "oc-gpg-wrapper-test-"))
-    const coordinator = new PinentryCoordinator()
-    const bridge = new PinentryBridge({ coordinator, socketDir: tmpDir })
+  it("reports conflicting gpg.conf and gpg-agent.conf settings", () => {
+    const parsed = parseGpgConfig(
+      "use-agent\npinentry-mode loopback\n",
+      "default-cache-ttl 28800\nno-allow-loopback-pinentry\n",
+    )
+    expect(parsed.pinentryMode).toBe("loopback")
+    expect(parsed.allowLoopbackPinentry).toBe(false)
+    expect(parsed.warnings).toEqual([
+      "gpg.conf sets 'pinentry-mode loopback', which forces gpg to prompt on a terminal instead of delegating PIN and touch prompts to gpg-agent's pinentry-program.",
+      "gpg-agent.conf sets 'no-allow-loopback-pinentry', which prevents yubikey_unlock from verifying PINs via Assuan loopback.",
+    ])
 
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "oc-gnupg-conf-"))
     try {
-      const env: Record<string, string | undefined> = { PATH: "/usr/bin:/bin" }
-      await bridge.prepareShellEnv(env, "git commit -S")
-
-      const firstGpg = env.PATH
-        ?.split(path.delimiter)
-        .map((dir) => path.join(dir, "gpg"))
-        .find((candidate) => existsSync(candidate))
-      expect(firstGpg).toBe(path.join(tmpDir, "bin", "gpg"))
+      writeFileSync(path.join(tmpDir, "gpg.conf"), "pinentry-mode loopback\n")
+      writeFileSync(
+        path.join(tmpDir, "gpg-agent.conf"),
+        `pinentry-program ${path.join(tmpDir, "missing-pinentry")}\n`,
+      )
+      const inspected = inspectGpgConfiguration({ gnupgHomeDir: tmpDir })
+      const report = formatCardStatusReport(true, { connected: false }, inspected)
+      expect(report).toContain("GPG Pinentry Mode: loopback")
+      expect(report).toContain(
+        `Warning: gpg-agent.conf pinentry-program does not exist: ${path.join(tmpDir, "missing-pinentry")}`,
+      )
     } finally {
-      coordinator.close()
-      await bridge.close()
       rmSync(tmpDir, { recursive: true, force: true })
     }
   })

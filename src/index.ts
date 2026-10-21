@@ -38,6 +38,7 @@ import {
   checkGpgAgentReady,
   formatCardStatusReport,
   getYubiKeyCardStatus,
+  inspectGpgConfiguration,
   lockYubiKey,
 } from "./yubikey.ts"
 
@@ -104,7 +105,11 @@ function registerStatusAndLockTools(
         checkGpgAgentReady({ socketPath: agentSocketPath, signal: context.signal }),
         getYubiKeyCardStatus({ signal: context.signal }),
       ])
-      return { content: formatCardStatusReport(gpgAgentReady, card), metadata: { gpgAgentReady, card } }
+      const gpgConfig = inspectGpgConfiguration()
+      return {
+        content: formatCardStatusReport(gpgAgentReady, card, gpgConfig),
+        metadata: { gpgAgentReady, card, gpgConfig },
+      }
     },
   })
   editor.add({

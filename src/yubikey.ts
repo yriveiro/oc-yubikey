@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process"
-import { existsSync, lstatSync, realpathSync } from "node:fs"
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs"
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
@@ -909,12 +909,116 @@ export function parseCardStatusOutput(raw: string): YubiKeyCardStatus {
   }
 }
 
+export interface GpgConfigStatus {
+  readonly pinentryMode?: string
+  readonly pinentryProgram?: string
+  readonly allowLoopbackPinentry: boolean
+  readonly warnings: ReadonlyArray<string>
+}
+
+function parseConfigEntries(raw: string | undefined): Array<readonly [string, string]> {
+  if (!raw) return []
+  const entries: Array<readonly [string, string]> = []
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith("#")) continue
+    const match = line.match(/^([A-Za-z0-9-]+)(?:[\s=]+(.*))?$/)
+    if (!match) continue
+    entries.push([match[1].toLowerCase(), (match[2] ?? "").trim()])
+  }
+  return entries
+}
+
+export function parseGpgConfig(
+  gpgConfRaw: string | undefined,
+  gpgAgentConfRaw: string | undefined,
+): GpgConfigStatus {
+  let pinentryMode: string | undefined
+  for (const [key, val] of parseConfigEntries(gpgConfRaw)) {
+    if (key === "pinentry-mode" && val) {
+      pinentryMode = val.toLowerCase()
+    }
+  }
+
+  let pinentryProgram: string | undefined
+  let allowLoopbackPinentry = true
+  for (const [key, val] of parseConfigEntries(gpgAgentConfRaw)) {
+    if (key === "pinentry-program" && val) {
+      pinentryProgram = val
+    } else if (key === "no-allow-loopback-pinentry") {
+      allowLoopbackPinentry = false
+    } else if (key === "allow-loopback-pinentry") {
+      allowLoopbackPinentry = true
+    }
+  }
+
+  const warnings: string[] = []
+  if (pinentryMode === "loopback") {
+    warnings.push(
+      "gpg.conf sets 'pinentry-mode loopback', which forces gpg to prompt on a terminal instead of delegating PIN and touch prompts to gpg-agent's pinentry-program.",
+    )
+  }
+  if (!allowLoopbackPinentry) {
+    warnings.push(
+      "gpg-agent.conf sets 'no-allow-loopback-pinentry', which prevents yubikey_unlock from verifying PINs via Assuan loopback.",
+    )
+  }
+
+  return {
+    ...(pinentryMode !== undefined ? { pinentryMode } : {}),
+    ...(pinentryProgram !== undefined ? { pinentryProgram } : {}),
+    allowLoopbackPinentry,
+    warnings,
+  }
+}
+
+function readOptionalTextFile(filePath: string): string | undefined {
+  return existsSync(filePath) ? readFileSync(filePath, "utf8") : undefined
+}
+
+export function inspectGpgConfiguration(options?: { gnupgHomeDir?: string }): GpgConfigStatus {
+  const gnupgHome =
+    options?.gnupgHomeDir ?? process.env.GNUPGHOME ?? path.join(os.homedir(), ".gnupg")
+  const parsed = parseGpgConfig(
+    readOptionalTextFile(path.join(gnupgHome, "gpg.conf")),
+    readOptionalTextFile(path.join(gnupgHome, "gpg-agent.conf")),
+  )
+  if (parsed.pinentryProgram && !existsSync(parsed.pinentryProgram)) {
+    return {
+      ...parsed,
+      warnings: [
+        ...parsed.warnings,
+        `gpg-agent.conf pinentry-program does not exist: ${parsed.pinentryProgram}`,
+      ],
+    }
+  }
+  return parsed
+}
+
+function formatGpgConfigLines(gpgConfig: GpgConfigStatus | undefined): string[] {
+  if (!gpgConfig) return []
+  const lines = [
+    `Pinentry Program: ${gpgConfig.pinentryProgram ?? "default (not set in gpg-agent.conf)"}`,
+    `GPG Pinentry Mode: ${gpgConfig.pinentryMode ?? "ask (default)"}`,
+  ]
+  for (const warning of gpgConfig.warnings) {
+    lines.push(`Warning: ${warning}`)
+  }
+  return lines
+}
+
 export function formatCardStatusReport(
   gpgAgentReady: boolean,
   card: YubiKeyCardStatus,
+  gpgConfig?: GpgConfigStatus,
 ): string {
+  const configLines = formatGpgConfigLines(gpgConfig)
   if (!card.connected) {
-    return `gpg-agent ready: ${gpgAgentReady ? "yes" : "no"}\nYubiKey OpenPGP card: not connected`
+    return [
+      `gpg-agent ready: ${gpgAgentReady ? "yes" : "no"}`,
+      "YubiKey OpenPGP card: not connected",
+      ...configLines,
+    ].join("\n")
   }
 
   const pinPolicyText = card.pinPolicy
@@ -940,6 +1044,7 @@ export function formatCardStatusReport(
     `PIN Retry Counters: ${retries}`,
     `Touch Policy (UIF): ${uifText}`,
     `gpg-agent Ready: ${gpgAgentReady ? "yes" : "no"}`,
+    ...configLines,
   ].join("\n")
 }
 
