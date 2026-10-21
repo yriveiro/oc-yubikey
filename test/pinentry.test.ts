@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test"
-import { spawn } from "node:child_process"
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { execFileSync, spawn } from "node:child_process"
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
@@ -13,10 +13,11 @@ import {
   findSshSecurityKeyFile,
   isAppleLaunchdSshAgentSocket,
   parseSshAgentSignRequest,
+  renderGpgWrapper,
   resolvePinentryCliPath,
 } from "../src/bridge.ts"
 import { PinentryCoordinator, type PromptOutputByKind } from "../src/coordinator.ts"
-import { sanitizeDisplayText } from "../src/protocol.ts"
+import { resolveIpcTarget, sanitizeDisplayText } from "../src/protocol.ts"
 import type {
   PromptPinOutput,
   PromptTouchOutput,
@@ -941,6 +942,7 @@ describe("YubiKey Touch Prompt & SSH_AUTH_SOCK / SSH_ASKPASS / Pinentry Bridge",
         {
           env: {
             ...process.env,
+            PINENTRY_USER_DATA: undefined,
             OC_YUBIKEY_SOCK: bridge.socketPath,
             OC_YUBIKEY_TOKEN: bridge.token,
             OC_YUBIKEY_COMMAND: "git fetch origin",
@@ -977,6 +979,7 @@ describe("YubiKey Touch Prompt & SSH_AUTH_SOCK / SSH_ASKPASS / Pinentry Bridge",
         const child = spawn(cliPath, [], {
           env: {
             ...process.env,
+            PINENTRY_USER_DATA: undefined,
             OC_YUBIKEY_SOCK: bridge.socketPath,
             OC_YUBIKEY_TOKEN: bridge.token,
             OC_YUBIKEY_COMMAND: "git commit -S",
@@ -1102,6 +1105,152 @@ describe("YubiKey Touch Prompt & SSH_AUTH_SOCK / SSH_ASKPASS / Pinentry Bridge",
       const blockedReply = await sendPinIpc()
       expect(blockedReply).toEqual({ ok: false, cancelled: true })
       expect(requested.length).toBe(1)
+    } finally {
+      coordinator.close()
+      await bridge.close()
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("Pinentry shim target resolution", () => {
+  async function startSocket(dir: string, name: string): Promise<{ path: string; close: () => Promise<void> }> {
+    const socketPath = path.join(dir, name)
+    const server = net.createServer()
+    await new Promise<void>((resolve) => server.listen(socketPath, () => resolve()))
+    chmodSync(socketPath, 0o600)
+    return {
+      path: socketPath,
+      close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    }
+  }
+
+  it("routes the prompt to the instance that owns the command, not the one the agent inherited", async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "oc-target-test-"))
+    const inherited = await startSocket(tmpDir, "inherited.sock")
+    const owner = await startSocket(tmpDir, "owner.sock")
+
+    try {
+      const target = resolveIpcTarget(
+        {
+          PINENTRY_USER_DATA: JSON.stringify({
+            sock: owner.path,
+            token: "owner-token",
+            cmd: "git commit -S",
+          }),
+          OC_YUBIKEY_SOCK: inherited.path,
+          OC_YUBIKEY_TOKEN: "inherited-token",
+        },
+        path.join(tmpDir, "active.json"),
+      )
+
+      expect(target.socketPath).toBe(owner.path)
+      expect(target.token).toBe("owner-token")
+      expect(target.command).toBe("git commit -S")
+    } finally {
+      await inherited.close()
+      await owner.close()
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it("keeps the socket and the token of one instance together", async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "oc-target-test-"))
+    const owner = await startSocket(tmpDir, "owner.sock")
+
+    try {
+      const target = resolveIpcTarget(
+        {
+          PINENTRY_USER_DATA: JSON.stringify({ sock: owner.path }),
+          OC_YUBIKEY_TOKEN: "inherited-token",
+        },
+        path.join(tmpDir, "active.json"),
+      )
+
+      expect(target.socketPath).toBeUndefined()
+      expect(target.token).toBeUndefined()
+    } finally {
+      await owner.close()
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it("falls back to the pointer of the running instance when the agent passed no user data", async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "oc-target-test-"))
+    const owner = await startSocket(tmpDir, "owner.sock")
+    const pointerPath = path.join(tmpDir, "active.json")
+    writeFileSync(
+      pointerPath,
+      JSON.stringify({ socketPath: owner.path, token: "pointer-token" }),
+      { mode: 0o600 },
+    )
+    chmodSync(pointerPath, 0o600)
+
+    try {
+      const target = resolveIpcTarget({}, pointerPath)
+
+      expect(target.socketPath).toBe(owner.path)
+      expect(target.token).toBe("pointer-token")
+    } finally {
+      await owner.close()
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it("drops a socket that is gone instead of prompting the wrong instance", async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "oc-target-test-"))
+    const gone = path.join(tmpDir, "gone.sock")
+
+    try {
+      const target = resolveIpcTarget(
+        { OC_YUBIKEY_SOCK: gone, OC_YUBIKEY_TOKEN: "inherited-token" },
+        path.join(tmpDir, "active.json"),
+      )
+
+      expect(target.socketPath).toBeUndefined()
+      expect(target.token).toBeUndefined()
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("gpg wrapper", () => {
+  it("asks gpg-agent for the PIN and keeps a pinentry mode the caller chose", async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "oc-gpg-wrapper-test-"))
+    const fakeGpg = path.join(tmpDir, "gpg")
+    const wrapper = path.join(tmpDir, "wrapper")
+    writeFileSync(fakeGpg, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n", { mode: 0o700 })
+    writeFileSync(wrapper, renderGpgWrapper(fakeGpg), { mode: 0o700 })
+
+    try {
+      const forced = execFileSync(wrapper, ["--detach-sign"]).toString().trim().split("\n")
+      expect(forced).toEqual(["--pinentry-mode", "ask", "--detach-sign"])
+
+      const chosen = execFileSync(wrapper, ["--pinentry-mode", "loopback", "--decrypt"])
+        .toString()
+        .trim()
+        .split("\n")
+      expect(chosen).toEqual(["--pinentry-mode", "loopback", "--decrypt"])
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it("puts the wrapper first on the PATH of a shell command", async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "oc-gpg-wrapper-test-"))
+    const coordinator = new PinentryCoordinator()
+    const bridge = new PinentryBridge({ coordinator, socketDir: tmpDir })
+
+    try {
+      const env: Record<string, string | undefined> = { PATH: "/usr/bin:/bin" }
+      await bridge.prepareShellEnv(env, "git commit -S")
+
+      const firstGpg = env.PATH
+        ?.split(path.delimiter)
+        .map((dir) => path.join(dir, "gpg"))
+        .find((candidate) => existsSync(candidate))
+      expect(firstGpg).toBe(path.join(tmpDir, "bin", "gpg"))
     } finally {
       coordinator.close()
       await bridge.close()

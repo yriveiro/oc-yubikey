@@ -207,41 +207,79 @@ export function parseJsonObject(
   }
 }
 
+interface IpcTargetCandidate {
+  readonly socketPath: string | undefined
+  readonly token: string | undefined
+  readonly command: string | undefined
+}
+
+function isLiveIpcSocket(socketPath: string): boolean {
+  return (
+    isSecureOwnedPath(path.dirname(socketPath), "dir") && isSecureOwnedPath(socketPath, "socket")
+  )
+}
+
+function readActivePointerCandidate(pointerPath: string): IpcTargetCandidate {
+  const dirPath = path.dirname(pointerPath)
+  if (!isSecureOwnedPath(dirPath, "dir") || !isSecureOwnedPath(pointerPath, "file")) {
+    return { socketPath: undefined, token: undefined, command: undefined }
+  }
+  try {
+    const pointer = parseJsonObject(readFileSync(pointerPath, "utf8"))
+    if (typeof pointer?.socketPath !== "string") {
+      return { socketPath: undefined, token: undefined, command: undefined }
+    }
+    return {
+      socketPath: pointer.socketPath,
+      token: typeof pointer.token === "string" ? pointer.token : undefined,
+      command: undefined,
+    }
+  } catch {
+    return { socketPath: undefined, token: undefined, command: undefined }
+  }
+}
+
+/**
+ * Resolves the plugin instance the pinentry shim has to talk to.
+ *
+ * The socket and the token identify one instance, so they are never taken from
+ * different candidates.
+ *
+ * `PINENTRY_USER_DATA` is the value gpg-agent hands to the pinentry program it
+ * launches, derived from the command that triggered the prompt, so it names the
+ * instance that owns that command. The ambient `OC_YUBIKEY_*` variables are
+ * inherited by the gpg-agent process from the shell that started it and can name
+ * an instance that is gone, so they only serve as a fallback. The `active.json`
+ * pointer names the most recently started instance.
+ */
 export function resolveIpcTarget(
   env: Readonly<Record<string, string | undefined>> = process.env,
+  pointerPath: string = path.join(getRuntimeSocketDirPath(), "active.json"),
 ): IpcTargetResolution {
   const userData = parseJsonObject(env.PINENTRY_USER_DATA)
-  const userSock = typeof userData?.sock === "string" ? userData.sock : undefined
-  const userToken = typeof userData?.token === "string" ? userData.token : undefined
-  const userCmd = typeof userData?.cmd === "string" ? userData.cmd : undefined
+  const candidates: readonly IpcTargetCandidate[] = [
+    {
+      socketPath: typeof userData?.sock === "string" ? userData.sock : undefined,
+      token: typeof userData?.token === "string" ? userData.token : undefined,
+      command: typeof userData?.cmd === "string" ? userData.cmd : undefined,
+    },
+    {
+      socketPath: env.OC_YUBIKEY_SOCK,
+      token: env.OC_YUBIKEY_TOKEN,
+      command: env.OC_YUBIKEY_COMMAND,
+    },
+    readActivePointerCandidate(pointerPath),
+  ]
 
-  let socketPath = env.OC_YUBIKEY_SOCK || userSock
-  let token = env.OC_YUBIKEY_TOKEN || userToken
-  const command = env.OC_YUBIKEY_COMMAND || userCmd
-
-  if (!socketPath || !token) {
-    const dirPath = getRuntimeSocketDirPath()
-    const pointerPath = path.join(dirPath, "active.json")
-    if (isSecureOwnedPath(dirPath, "dir") && isSecureOwnedPath(pointerPath, "file")) {
-      try {
-        const pointer = parseJsonObject(readFileSync(pointerPath, "utf8"))
-        if (typeof pointer?.socketPath === "string") {
-          if (!socketPath) socketPath = pointer.socketPath
-          if (!token && typeof pointer.token === "string") token = pointer.token
-        }
-      } catch {
-        // Ignore unreadable pointer file
-      }
+  for (const candidate of candidates) {
+    if (!candidate.socketPath || !candidate.token) continue
+    if (!isLiveIpcSocket(candidate.socketPath)) continue
+    return {
+      socketPath: candidate.socketPath,
+      token: candidate.token,
+      command: candidate.command ?? env.OC_YUBIKEY_COMMAND,
     }
   }
 
-  if (socketPath) {
-    const parentDir = path.dirname(socketPath)
-    if (!isSecureOwnedPath(parentDir, "dir") || !isSecureOwnedPath(socketPath, "socket")) {
-      socketPath = undefined
-      token = undefined
-    }
-  }
-
-  return { socketPath, token, command }
+  return { socketPath: undefined, token: undefined, command: env.OC_YUBIKEY_COMMAND }
 }

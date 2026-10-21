@@ -55,6 +55,10 @@ Hardware-backed YubiKey commands (`git pull`, `git push`, `ssh`, `git commit -S`
    gpg-connect-agent reloadagent /bye
    ```
 
+   `pinentry-program` is what makes `gpg-agent` ask this plugin for the PIN instead of
+   prompting on a terminal. It has to point at the `bin/oc-yubikey` of the checkout the
+   running plugin came from. The agent keeps that path until you reload it.
+
 3. **Verify inside OpenCode:**
    Run `/yubikey status` in the TUI prompt or ask the agent to run `yubikey_status`.
 
@@ -210,6 +214,18 @@ sequenceDiagram
   end
 ```
 
+`gpg-agent` only launches the pinentry program when gpg asks for the passphrase in `ask`
+pinentry mode. In `loopback` mode the agent hands the inquiry back to gpg, which prompts
+on a terminal, and a shell without a tty can never answer that prompt. The plugin
+therefore puts a `gpg` wrapper first on the `PATH` of the commands it runs. The wrapper
+executes the real gpg with `--pinentry-mode ask` unless the caller asked for a mode
+itself.
+
+The shim talks to the instance that owns the running command. `gpg-agent` passes that
+instance as `PINENTRY_USER_DATA` to the pinentry program it launches, and the shim
+prefers it over the `OC_YUBIKEY_*` variables, which the agent inherited from the shell
+that started it and which can name an instance that is gone.
+
 ### Flow 3: Direct Assuan Loopback Unlock (`yubikey_unlock`)
 
 ```mermaid
@@ -299,6 +315,13 @@ stateDiagram-v2
 | `OC_YUBIKEY_SOCK` | Injected automatically by `PinentryBridge.prepareShellEnv()` |
 | `OC_YUBIKEY_TOKEN` | Per-instance 256-bit hex authentication token injected into shell subcommands |
 | `OC_YUBIKEY_COMMAND` | Summarized shell command displayed in `TouchModal` / `PinentryModal` |
+| `PINENTRY_USER_DATA` | Same socket, token and command as JSON; `gpg-agent` hands it to the pinentry program it launches, and it names the instance that owns the running command |
+
+`bin/oc-yubikey` resolves the instance to talk to from `PINENTRY_USER_DATA` first, then
+`OC_YUBIKEY_SOCK` / `OC_YUBIKEY_TOKEN`, then the `active.json` pointer of the running
+instance. `gpg-agent` inherits the environment of the shell that started it, so its copy
+of `OC_YUBIKEY_SOCK` can name an instance that is gone. The `PINENTRY_USER_DATA` it
+passes to the pinentry program names the instance of the command that is running now.
 
 ### macOS Apple `launchd` `ssh-agent` vs. Homebrew OpenSSH (`-sk` Keys)
 
@@ -309,6 +332,7 @@ macOS's built-in `/usr/bin/ssh-agent` (`com.apple.launchd.*/Listeners`) ships `/
 ### Troubleshooting
 
 - **`gpg-agent rejected loopback pinentry mode`**: Add `allow-loopback-pinentry` to `~/.gnupg/gpg-agent.conf` and run `gpg-connect-agent reloadagent /bye`.
+- **`git commit -S` hangs and no PIN modal appears**: `gpg` is asking for the passphrase on a terminal that the shell does not have. The plugin puts a `gpg` wrapper first on the `PATH` of the commands it runs, so `gpg` stays in `ask` pinentry mode and `gpg-agent` asks the pinentry program, which is this plugin. Two things still break that: `gpg.program` in the git config pointing at an absolute `gpg` path, which bypasses the `PATH`, and a `pinentry-program` in `~/.gnupg/gpg-agent.conf` that points at another checkout than the running plugin. Check both when the modal stays away.
 - **Touch modal does not appear during `gpg --sign` outside OpenCode's shell**: Ensure `pinentry-program /path/to/oc-yubikey/bin/oc-yubikey` is set in `~/.gnupg/gpg-agent.conf` and reload `gpg-agent`.
 - **YubiKey not detected (`connected: false`)**: Verify `gpg --card-status` succeeds in your terminal and that no other process holds an exclusive PC/SC lock on the smartcard reader.
 - **TUI toast `Plugin failed: github:<owner>/oc-yubikey`**: Refresh the installed copy from the `/plugins` dialog, or remove `~/.cache/opencode/npm/git-oc-yubikey-*` so OpenCode reinstalls the latest commit. `src/tui.tsx` uses `@opentui/solid`'s reconciler primitives (`createElement`, `createTextNode`, `insertNode`, `insert`, `setProp`, `effect`, `createComponent`) directly rather than raw JSX syntax so it loads cleanly from `~/.cache/opencode/npm/.../node_modules` where OpenTUI's Babel Solid transform does not run.

@@ -6,6 +6,7 @@ import {
   lstatSync,
   mkdirSync,
   readdirSync,
+  readFileSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -38,6 +39,7 @@ export const SSH_AGENT_MSG = {
 const MAX_IPC_LINE_BYTES = 64 * 1024
 const MAX_SSH_AGENT_FRAME_BYTES = 256 * 1024
 const MAX_SSH_PROXIES = 16
+const GPG_WRAPPER_DIR_NAME = "bin"
 
 export function isAppleAgentSocket(socketPath: string): boolean {
   return /com\.apple\.launchd\.[^/]+\/Listeners$/.test(socketPath)
@@ -169,6 +171,36 @@ export function getRuntimeSocketDir(): string {
 export function resolvePinentryCliPath(): string {
   const currentDir = path.dirname(fileURLToPath(import.meta.url))
   return path.resolve(currentDir, "..", "bin", "oc-yubikey")
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+/**
+ * Renders a `gpg` wrapper that asks gpg-agent for the PIN through its pinentry
+ * program instead of letting gpg prompt on a terminal.
+ *
+ * gpg only asks its pinentry program when it runs in "ask" pinentry mode. In
+ * "loopback" mode gpg-agent hands the passphrase inquiry back to gpg, which
+ * prompts on the terminal itself, and a shell without a tty can never answer
+ * that prompt. An explicit `--pinentry-mode` on the command line wins over the
+ * wrapper, so a caller that asked for a mode keeps it.
+ */
+export function renderGpgWrapper(gpgPath: string): string {
+  const quoted = shellQuote(gpgPath)
+  return [
+    "#!/bin/sh",
+    "# oc-yubikey: keep gpg in ask pinentry mode so gpg-agent asks the pinentry",
+    "# program for the PIN and the prompt can reach the OpenCode TUI.",
+    'for arg in "$@"; do',
+    "  case \"$arg\" in",
+    `    --pinentry-mode|--pinentry-mode=*) exec ${quoted} "$@" ;;`,
+    "  esac",
+    "done",
+    `exec ${quoted} --pinentry-mode ask "$@"`,
+    "",
+  ].join("\n")
 }
 
 export function findSshSecurityKeyFile(
@@ -360,6 +392,35 @@ export class PinentryBridge {
     const b = Buffer.from(this.authToken, "utf8")
     if (a.length !== b.length) return false
     return timingSafeEqual(a, b)
+  }
+
+  /**
+   * Writes the `gpg` wrapper that keeps gpg in ask pinentry mode, so that
+   * gpg-agent asks the pinentry program for the PIN instead of gpg asking on a
+   * terminal that a non-interactive shell does not have.
+   *
+   * Returns the directory to prepend to `PATH`, or undefined when no trusted
+   * gpg binary is available to wrap.
+   */
+  private ensureGpgWrapperDir(): string | undefined {
+    const gpgPath = resolveTrustedExecutable("gpg")
+    if (!path.isAbsolute(gpgPath)) return undefined
+
+    const wrapperDir = path.join(this.socketDir, GPG_WRAPPER_DIR_NAME)
+    const wrapperPath = path.join(wrapperDir, "gpg")
+    const content = renderGpgWrapper(gpgPath)
+    try {
+      if (existsSync(wrapperPath) && readFileSync(wrapperPath, "utf8") === content) {
+        return wrapperDir
+      }
+      mkdirSync(wrapperDir, { recursive: true, mode: 0o700 })
+      chmodSync(wrapperDir, 0o700)
+      writeFileSync(wrapperPath, content, { mode: 0o700 })
+      chmodSync(wrapperPath, 0o700)
+    } catch {
+      return undefined
+    }
+    return wrapperDir
   }
 
   async start(): Promise<void> {
@@ -727,7 +788,8 @@ export class PinentryBridge {
 
   /**
    * Injects `SSH_AUTH_SOCK`, `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE`, `OC_YUBIKEY_SOCK`,
-   * `OC_YUBIKEY_TOKEN`, and `PINENTRY_USER_DATA` into a shell command environment before execution.
+   * `OC_YUBIKEY_TOKEN`, `PINENTRY_USER_DATA`, and a `gpg` wrapper directory into a shell
+   * command environment before execution.
    */
   async prepareShellEnv(
     env: Record<string, string | undefined>,
@@ -745,6 +807,14 @@ export class PinentryBridge {
       env.OC_YUBIKEY_COMMAND = summarizedCmd
     } else {
       delete env.OC_YUBIKEY_COMMAND
+    }
+
+    const gpgWrapperDir = this.ensureGpgWrapperDir()
+    if (gpgWrapperDir) {
+      const currentPath = env.PATH
+      env.PATH = currentPath
+        ? `${gpgWrapperDir}${path.delimiter}${currentPath}`
+        : gpgWrapperDir
     }
 
     const cliPath = resolvePinentryCliPath()
@@ -881,6 +951,7 @@ export class PinentryBridge {
 
     rmSync(this.ipcSocketPath, { force: true })
     rmSync(this.activePointerPath, { force: true })
+    rmSync(path.join(this.socketDir, GPG_WRAPPER_DIR_NAME, "gpg"), { force: true })
     for (const [, entry] of this.sshProxies) {
       rmSync(entry.proxySocketPath, { force: true })
     }

@@ -138,6 +138,7 @@ declare module "node:path" {
   export function basename(p: string): string
   export function relative(from: string, to: string): string
   export function isAbsolute(p: string): boolean
+  export const delimiter: string
   const pathDefault: {
     join: typeof join
     resolve: typeof resolve
@@ -145,6 +146,7 @@ declare module "node:path" {
     basename: typeof basename
     relative: typeof relative
     isAbsolute: typeof isAbsolute
+    delimiter: typeof delimiter
   }
   export default pathDefault
 }
@@ -173,6 +175,11 @@ declare module "node:child_process" {
       stdio?: "inherit" | readonly ("ignore" | "pipe" | "inherit")[]
     },
   ): ChildProcess
+  export function execFileSync(
+    file: string,
+    args?: readonly string[],
+    options?: { env?: Record<string, string | undefined> },
+  ): Buffer
 }
 
 declare module "node:stream" {
