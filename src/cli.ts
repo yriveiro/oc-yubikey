@@ -221,15 +221,19 @@ function isPassphraseInputFlag(arg: string): boolean {
   return PASSPHRASE_INPUT_FLAGS.has(flag)
 }
 
+const GPG_SIGN_FLAGS = new Set<string>(["-s", "--sign", "-b", "--detach-sign", "--clearsign"])
+
 interface InspectedGpgArgs {
   readonly hasCustomPassphraseInput: boolean
   readonly hasPinentryMode: boolean
+  readonly isSigning: boolean
   readonly callerStatusFd: number | undefined
 }
 
 function inspectGpgWrapperArgs(args: readonly string[]): InspectedGpgArgs {
   let hasCustomPassphraseInput = false
   let hasPinentryMode = false
+  let isSigning = false
   let callerStatusFd: number | undefined
 
   for (let i = 0; i < args.length; i++) {
@@ -239,6 +243,8 @@ function inspectGpgWrapperArgs(args: readonly string[]): InspectedGpgArgs {
       hasCustomPassphraseInput = true
     } else if (arg === "--pinentry-mode" || arg.startsWith("--pinentry-mode=")) {
       hasPinentryMode = true
+    } else if (GPG_SIGN_FLAGS.has(arg) || (/^-[A-Za-z]+$/.test(arg) && /[sb]/.test(arg))) {
+      isSigning = true
     } else if (arg === "--status-fd") {
       callerStatusFd = parseOptionalInt(args[i + 1]) ?? callerStatusFd
       i += 1
@@ -247,7 +253,7 @@ function inspectGpgWrapperArgs(args: readonly string[]): InspectedGpgArgs {
     }
   }
 
-  return { hasCustomPassphraseInput, hasPinentryMode, callerStatusFd }
+  return { hasCustomPassphraseInput, hasPinentryMode, isSigning, callerStatusFd }
 }
 
 function buildWrappedGpgArgs(
@@ -271,15 +277,22 @@ interface GpgStatusMonitorOptions {
   readonly socketPath: string
   readonly token: string
   readonly command: string | undefined
+  readonly isSigning: boolean
   readonly commandStream: WritableStream | undefined
   readonly onActiveRequest: (req: ActiveIpcHandle | null) => void
+  readonly onCancelTouch: () => void
+}
+
+interface GpgStatusMonitorHandle {
+  readonly onChunk: (chunk: Buffer | string) => void
+  readonly dispose: () => void
 }
 
 async function promptGpgLoopbackPin(
   options: GpgStatusMonitorOptions,
   userIdHint: string | undefined,
   error: string | undefined,
-): Promise<void> {
+): Promise<boolean> {
   const req = sendIpcRequest(options.socketPath, {
     token: options.token,
     type: "pin",
@@ -299,18 +312,64 @@ async function promptGpgLoopbackPin(
   options.onActiveRequest(null)
   if (res.ok && !res.cancelled && typeof res.pin === "string") {
     options.commandStream?.write(`${res.pin}\n`)
-    return
+    return true
   }
   options.commandStream?.write("\x04\n")
   options.commandStream?.end()
+  return false
 }
 
-function createGpgStatusMonitor(options: GpgStatusMonitorOptions): (chunk: Buffer | string) => void {
+function createGpgStatusMonitor(options: GpgStatusMonitorOptions): GpgStatusMonitorHandle {
   let statusBuffer = ""
   let userIdHint: string | undefined
   let lastError: string | undefined
+  let pinInFlight = false
+  let sigCompleted = false
+  let touchTimer: ReturnType<typeof setTimeout> | undefined
+  let activeTouchReq: ActiveIpcHandle | null = null
   const statusQueue: string[] = []
   let draining = false
+  const touchDelayMs = parseOptionalInt(process.env.OC_YUBIKEY_GPG_TOUCH_DELAY_MS) ?? 250
+
+  const clearTouchPrompt = (): void => {
+    if (touchTimer) {
+      clearTimeout(touchTimer)
+      touchTimer = undefined
+    }
+    if (activeTouchReq) {
+      activeTouchReq.close()
+      activeTouchReq = null
+    }
+  }
+
+  const scheduleTouchPrompt = (): void => {
+    if (!options.isSigning || sigCompleted || pinInFlight || activeTouchReq) return
+    if (touchTimer) {
+      clearTimeout(touchTimer)
+      touchTimer = undefined
+    }
+    touchTimer = setTimeout(() => {
+      if (sigCompleted || pinInFlight || activeTouchReq) return
+      const req = sendIpcRequest(options.socketPath, {
+        token: options.token,
+        type: "touch",
+        title: "Touch Your YubiKey",
+        description: userIdHint
+          ? `Confirm user presence on your YubiKey for ${userIdHint}`
+          : "Confirm user presence on your YubiKey to sign",
+        prompt: "Touch YubiKey",
+        ...(options.command ? { command: options.command } : {}),
+      })
+      activeTouchReq = req
+      void req.promise
+        .then((res) => {
+          if (res.cancelled && activeTouchReq === req && !sigCompleted) {
+            options.onCancelTouch()
+          }
+        })
+        .catch(() => {})
+    }, touchDelayMs)
+  }
 
   const handleStatusLine = async (line: string): Promise<void> => {
     const body = line.slice("[GNUPG:] ".length).trim()
@@ -318,12 +377,22 @@ function createGpgStatusMonitor(options: GpgStatusMonitorOptions): (chunk: Buffe
       const firstSpace = body.indexOf(" ", "USERID_HINT ".length)
       userIdHint = firstSpace !== -1 ? body.slice(firstSpace + 1).trim() || undefined : undefined
     } else if (body.startsWith("BAD_PASSPHRASE")) {
+      clearTouchPrompt()
       lastError = "Bad PIN"
     } else if (body.startsWith("GET_HIDDEN passphrase.")) {
+      clearTouchPrompt()
+      pinInFlight = true
       const error = lastError
       lastError = undefined
-      await promptGpgLoopbackPin(options, userIdHint, error)
+      const submitted = await promptGpgLoopbackPin(options, userIdHint, error)
+      pinInFlight = false
       options.onActiveRequest(null)
+      if (submitted) scheduleTouchPrompt()
+    } else if (body.startsWith("BEGIN_SIGNING") || body.startsWith("GOT_IT")) {
+      scheduleTouchPrompt()
+    } else if (body.startsWith("SIG_CREATED ")) {
+      sigCompleted = true
+      clearTouchPrompt()
     }
   }
 
@@ -337,18 +406,24 @@ function createGpgStatusMonitor(options: GpgStatusMonitorOptions): (chunk: Buffe
     draining = false
   }
 
-  return (chunk: Buffer | string): void => {
-    statusBuffer += typeof chunk === "string" ? chunk : chunk.toString("utf8")
-    let idx = statusBuffer.indexOf("\n")
-    while (idx !== -1) {
-      const line = statusBuffer.slice(0, idx).replace(/\r$/, "")
-      statusBuffer = statusBuffer.slice(idx + 1)
-      idx = statusBuffer.indexOf("\n")
-      if (line.startsWith("[GNUPG:] ")) {
-        statusQueue.push(line)
+  return {
+    onChunk: (chunk: Buffer | string): void => {
+      statusBuffer += typeof chunk === "string" ? chunk : chunk.toString("utf8")
+      let idx = statusBuffer.indexOf("\n")
+      while (idx !== -1) {
+        const line = statusBuffer.slice(0, idx).replace(/\r$/, "")
+        statusBuffer = statusBuffer.slice(idx + 1)
+        idx = statusBuffer.indexOf("\n")
+        if (line.startsWith("[GNUPG:] ")) {
+          statusQueue.push(line)
+        }
       }
-    }
-    void drain()
+      void drain()
+    },
+    dispose: (): void => {
+      sigCompleted = true
+      clearTouchPrompt()
+    },
   }
 }
 
@@ -377,7 +452,23 @@ function runGpgWrapperMode(args: readonly string[]): void {
   })
 
   let activePinRequest: ActiveIpcHandle | null = null
+  const monitor = createGpgStatusMonitor({
+    socketPath,
+    token,
+    command,
+    isSigning: inspected.isSigning,
+    commandStream: child.stdio[3] as WritableStream | undefined,
+    onActiveRequest: (req) => {
+      activePinRequest = req
+    },
+    onCancelTouch: () => {
+      child.kill("SIGTERM")
+      process.exit(130)
+    },
+  })
+
   registerSignalCleanup(() => {
+    monitor.dispose()
     activePinRequest?.close()
     child.kill("SIGTERM")
     process.exit(130)
@@ -387,33 +478,25 @@ function runGpgWrapperMode(args: readonly string[]): void {
   process.stdin.on("end", () => child.stdin.end())
   process.stdin.on("error", () => child.stdin.end())
 
-  const onStatusChunk = createGpgStatusMonitor({
-    socketPath,
-    token,
-    command,
-    commandStream: child.stdio[3] as WritableStream | undefined,
-    onActiveRequest: (req) => {
-      activePinRequest = req
-    },
-  })
-
   child.stdout.on("data", (chunk: Buffer | string) => {
-    if (inspected.callerStatusFd === 1) onStatusChunk(chunk)
+    if (inspected.callerStatusFd === 1) monitor.onChunk(chunk)
     process.stdout.write(chunk)
   })
   child.stderr.on("data", (chunk: Buffer | string) => {
-    if (inspected.callerStatusFd === 2) onStatusChunk(chunk)
+    if (inspected.callerStatusFd === 2) monitor.onChunk(chunk)
     process.stderr.write(chunk)
   })
   if (useDedicatedStatusPipe) {
-    ;(child.stdio[4] as ReadableStream | undefined)?.on("data", onStatusChunk)
+    ;(child.stdio[4] as ReadableStream | undefined)?.on("data", monitor.onChunk)
   }
 
   child.on("error", () => {
+    monitor.dispose()
     activePinRequest?.close()
     process.exit(127)
   })
   child.on("close", (code) => {
+    monitor.dispose()
     activePinRequest?.close()
     process.exit(code ?? 1)
   })
