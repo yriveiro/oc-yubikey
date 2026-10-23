@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, lstatSync, readFileSync } from "node:fs"
+import { chmodSync, existsSync, lstatSync, readFileSync, realpathSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 
@@ -294,12 +294,24 @@ export interface LocationIdentity {
   readonly workspaceID?: string
 }
 
+export function normalizeCanonicalDirectory(dirPath: string): string {
+  const resolved = path.resolve(dirPath)
+  try {
+    return realpathSync(resolved)
+  } catch {
+    return resolved
+  }
+}
+
 export function isMatchingLocation(
   eventLocation: LocationIdentity | undefined,
   activeLocation: LocationIdentity | undefined,
 ): boolean {
   if (!eventLocation?.directory || !activeLocation?.directory) return false
-  if (path.resolve(eventLocation.directory) !== path.resolve(activeLocation.directory)) {
+  if (
+    normalizeCanonicalDirectory(eventLocation.directory) !==
+    normalizeCanonicalDirectory(activeLocation.directory)
+  ) {
     return false
   }
   if (

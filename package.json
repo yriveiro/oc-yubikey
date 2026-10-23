@@ -12,7 +12,8 @@
   },
   "bin": {
     "oc-yubikey": "./bin/oc-yubikey",
-    "oc-yubikey-gpg": "./bin/oc-yubikey-gpg"
+    "oc-yubikey-gpg": "./bin/oc-yubikey-gpg",
+    "oc-yubikey-ssh": "./bin/oc-yubikey-ssh"
   },
   "files": [
     "index.ts",

@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url"
 import {
   classifyAskpassPrompt,
   encodeAssuanData,
+  getRuntimeSocketDirPath,
+  isSecureOwnedPath,
   parseAssuanData,
   parseOptionalInt,
   resolveIpcTarget,
@@ -150,6 +152,7 @@ function collectSelfPaths(): Set<string> {
     cliFile,
     path.join(binDir, "oc-yubikey"),
     path.join(binDir, "oc-yubikey-gpg"),
+    path.join(binDir, "oc-yubikey-ssh"),
   ]
   const selfPaths = new Set<string>()
   for (const candidate of candidates) {
@@ -206,6 +209,106 @@ function resolveRealGpgExecutable(): string {
     }
   }
   return "gpg"
+}
+
+const SSH_MUX_SKIP_FLAGS = new Set<string>(["-V", "-G", "-Q", "-O", "-W", "-M", "-S"])
+const SSH_CONTROL_OPT_PREFIX = /^control(?:master|path|persist)(?:=|\s)/i
+
+function hasExplicitSshControlOption(args: readonly string[]): boolean {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (!arg || arg === "--") break
+    if (SSH_MUX_SKIP_FLAGS.has(arg)) return true
+    if (arg === "-o") {
+      const next = args[i + 1] ?? ""
+      if (SSH_CONTROL_OPT_PREFIX.test(next.trim())) return true
+      i += 1
+      continue
+    }
+    if (arg.startsWith("-o") && SSH_CONTROL_OPT_PREFIX.test(arg.slice(2).trim())) {
+      return true
+    }
+  }
+  return false
+}
+
+function resolveSshControlPath(socketPath: string | undefined): string | undefined {
+  if (process.env.OC_YUBIKEY_SSH_MUX === "0") return undefined
+  const muxDir =
+    process.env.OC_YUBIKEY_MUX_DIR ||
+    (socketPath ? path.dirname(socketPath) : getRuntimeSocketDirPath())
+  if (!isSecureOwnedPath(muxDir, "dir")) return undefined
+  const controlPath = path.join(muxDir, "m-%C")
+  if (controlPath.length + 58 >= 104) return undefined
+  return controlPath
+}
+
+function resolveAskpassSelfScript(): string {
+  const cliFile = fileURLToPath(import.meta.url)
+  return path.resolve(path.dirname(cliFile), "..", "bin", "oc-yubikey")
+}
+
+function runSshWrapperMode(args: readonly string[]): void {
+  const selfPaths = collectSelfPaths()
+  const sshBin =
+    [
+      process.env.OC_YUBIKEY_SSH_BIN,
+      "/opt/homebrew/bin/ssh",
+      "/usr/local/bin/ssh",
+      "/usr/bin/ssh",
+    ].find(
+      (bin): bin is string => typeof bin === "string" && isSafeFallbackExecutable(bin, selfPaths),
+    ) ?? "ssh"
+  const { socketPath, token, command } = resolveIpcTarget()
+  const childEnv: Record<string, string | undefined> = { ...process.env }
+
+  if (socketPath && token && existsSync(socketPath)) {
+    const effectiveCmd = command || `ssh ${args.join(" ")}`.slice(0, 80)
+    childEnv.OC_YUBIKEY_SOCK = socketPath
+    childEnv.OC_YUBIKEY_TOKEN = token
+    childEnv.OC_YUBIKEY_COMMAND = effectiveCmd
+    childEnv.PINENTRY_USER_DATA = JSON.stringify({
+      sock: socketPath,
+      token,
+      cmd: effectiveCmd,
+    })
+    const askpassScript = resolveAskpassSelfScript()
+    if (!childEnv.SSH_ASKPASS && existsSync(askpassScript)) {
+      childEnv.SSH_ASKPASS = askpassScript
+    }
+    if (!childEnv.SSH_ASKPASS_REQUIRE) {
+      childEnv.SSH_ASKPASS_REQUIRE = "force"
+    }
+    if (!childEnv.DISPLAY) {
+      childEnv.DISPLAY = "oc-yubikey:0"
+    }
+  }
+  delete childEnv.OC_YUBIKEY_MODE
+
+  const controlPath = hasExplicitSshControlOption(args)
+    ? undefined
+    : resolveSshControlPath(socketPath)
+  const persistSeconds = parseOptionalInt(process.env.OC_YUBIKEY_SSH_CONTROL_PERSIST) ?? 600
+  const sshArgs = controlPath
+    ? [
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        `ControlPersist=${persistSeconds}`,
+        "-o",
+        `ControlPath=${controlPath}`,
+        ...args,
+      ]
+    : [...args]
+
+  const child = spawn(sshBin, sshArgs, { stdio: "inherit", env: childEnv })
+  registerSignalCleanup(() => {
+    child.kill("SIGTERM")
+  })
+  child.on("exit", (code) => {
+    process.exit(code ?? 0)
+  })
+  child.on("error", () => process.exit(255))
 }
 
 const PASSPHRASE_INPUT_FLAGS = new Set<string>([
@@ -745,13 +848,20 @@ function extractPositionalPrompt(args: readonly string[]): string | null {
 }
 
 const rawArgs = process.argv.slice(2)
+const invokedBinName = path.basename(process.argv[1] ?? "")
 const isGpgWrapperInvocation =
   process.env.OC_YUBIKEY_MODE === "gpg" ||
-  path.basename(process.argv[1] ?? "") === "oc-yubikey-gpg" ||
+  invokedBinName === "oc-yubikey-gpg" ||
   rawArgs[0] === "--gpg-wrapper"
+const isSshWrapperInvocation =
+  process.env.OC_YUBIKEY_MODE === "ssh" ||
+  invokedBinName === "oc-yubikey-ssh" ||
+  rawArgs[0] === "--ssh-wrapper"
 
 if (isGpgWrapperInvocation) {
   runGpgWrapperMode(rawArgs[0] === "--gpg-wrapper" ? rawArgs.slice(1) : rawArgs)
+} else if (isSshWrapperInvocation) {
+  runSshWrapperMode(rawArgs[0] === "--ssh-wrapper" ? rawArgs.slice(1) : rawArgs)
 } else {
   const positionalPrompt = extractPositionalPrompt(rawArgs)
   if (positionalPrompt !== null) {

@@ -1,6 +1,15 @@
 import { describe, expect, it } from "bun:test"
 import { spawn } from "node:child_process"
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs"
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
@@ -109,6 +118,15 @@ function handleMockCommandLine(
       ? `S KEYINFO ${state.sigKeygrip} T ${state.aid} OPENPGP.1 ${cachedFlag} - - - A\n`
       : ""
     socket.write(`${keyinfoLine}OK\n`)
+    return
+  }
+  if (line === "SCD RESET" || line === "RELOADAGENT") {
+    state.pinCachedInAgent = false
+    socket.write("OK\n")
+    return
+  }
+  if (line === "PKSIGN" && state.pinCachedInAgent) {
+    socket.write("D (7:sig-val)\nOK\n")
     return
   }
   if (line === "PKSIGN" || line.startsWith("SCD CHECKPIN ")) {
@@ -1654,6 +1672,234 @@ EOF
         else process.env[k] = v
       }
       rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it("multiplexes SSH connections via GIT_SSH_COMMAND and preserves active session routing across background location boots", async () => {
+    const baseTmp = existsSync("/tmp") ? "/tmp" : os.tmpdir()
+    const tmpDir = mkdtempSync(path.join(baseTmp, "oc-ssh-mux-"))
+    const repoWorktrees = path.join(tmpDir, "repo-worktrees")
+    const worktreeA = path.join(repoWorktrees, "wt-a")
+    const worktreeSibling = path.join(repoWorktrees, "wt-sibling")
+    const symlinkToWorktreeA = path.join(tmpDir, "wt-a-link")
+    const idleBackgroundDir = path.join(tmpDir, "idle-bg")
+    mkdirSync(worktreeA, { recursive: true })
+    mkdirSync(worktreeSibling, { recursive: true })
+    mkdirSync(idleBackgroundDir, { recursive: true })
+    symlinkSync(worktreeA, symlinkToWorktreeA)
+
+    const mockSsh = path.join(tmpDir, "mock-ssh.sh")
+    writeFileSync(
+      mockSsh,
+      `#!/bin/sh
+control_master=""
+control_persist=""
+control_path=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o)
+      shift
+      case "$1" in
+        ControlMaster=*) control_master="\${1#ControlMaster=}" ;;
+        ControlPersist=*) control_persist="\${1#ControlPersist=}" ;;
+        ControlPath=*) control_path="\${1#ControlPath=}" ;;
+      esac
+      ;;
+    -oControlMaster=*) control_master="\${1#-oControlMaster=}" ;;
+    -oControlPersist=*) control_persist="\${1#-oControlPersist=}" ;;
+    -oControlPath=*) control_path="\${1#-oControlPath=}" ;;
+  esac
+  shift
+done
+
+if [ "$control_master" != "auto" ] || [ -z "$control_persist" ] || [ -z "$control_path" ]; then
+  echo "missing ControlMaster options: master=$control_master persist=$control_persist path=$control_path" >&2
+  exit 2
+fi
+
+mux_file=$(printf '%s' "$control_path" | sed 's/%C/testmuxhash/g')
+if [ ! -e "$mux_file" ]; then
+  if [ -z "$SSH_ASKPASS" ]; then
+    echo "missing SSH_ASKPASS" >&2
+    exit 3
+  fi
+  "$SSH_ASKPASS" "Confirm user presence for key ED25519-SK SHA256:muxHardwareKey" || exit 4
+  : > "$mux_file"
+fi
+echo "ssh-mux-ok"
+exit 0
+`,
+      { mode: 0o755 },
+    )
+    chmodSync(mockSsh, 0o755)
+
+    const savedEnv = {
+      OC_YUBIKEY_SOCK: process.env.OC_YUBIKEY_SOCK,
+      OC_YUBIKEY_TOKEN: process.env.OC_YUBIKEY_TOKEN,
+      OC_YUBIKEY_COMMAND: process.env.OC_YUBIKEY_COMMAND,
+      OC_YUBIKEY_SSH_BIN: process.env.OC_YUBIKEY_SSH_BIN,
+      PINENTRY_USER_DATA: process.env.PINENTRY_USER_DATA,
+      SSH_ASKPASS: process.env.SSH_ASKPASS,
+      SSH_ASKPASS_REQUIRE: process.env.SSH_ASKPASS_REQUIRE,
+      DISPLAY: process.env.DISPLAY,
+      GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND,
+      GPG_TTY: process.env.GPG_TTY,
+      GIT_CONFIG_COUNT: process.env.GIT_CONFIG_COUNT,
+      GIT_CONFIG_KEY_0: process.env.GIT_CONFIG_KEY_0,
+      GIT_CONFIG_VALUE_0: process.env.GIT_CONFIG_VALUE_0,
+    }
+
+    delete process.env.OC_YUBIKEY_SOCK
+    delete process.env.OC_YUBIKEY_TOKEN
+    delete process.env.OC_YUBIKEY_COMMAND
+    process.env.OC_YUBIKEY_SSH_BIN = mockSsh
+    delete process.env.PINENTRY_USER_DATA
+    delete process.env.SSH_ASKPASS
+    delete process.env.SSH_ASKPASS_REQUIRE
+    delete process.env.DISPLAY
+    delete process.env.GIT_SSH_COMMAND
+    delete process.env.GIT_CONFIG_COUNT
+    delete process.env.GIT_CONFIG_KEY_0
+    delete process.env.GIT_CONFIG_VALUE_0
+
+    const requestedA: RequestSummary[] = []
+    const requestedB: RequestSummary[] = []
+    const coordinatorA = new PinentryCoordinator({
+      onRequested(summary) {
+        requestedA.push(summary)
+        setTimeout(() => coordinatorA.confirmTouch(summary.requestID), 15)
+      },
+    })
+    const coordinatorB = new PinentryCoordinator({
+      onRequested(summary) {
+        requestedB.push(summary)
+        setTimeout(() => coordinatorB.confirmTouch(summary.requestID), 15)
+      },
+    })
+
+    const bridgeA = new PinentryBridge({
+      coordinator: coordinatorA,
+      socketDir: tmpDir,
+      directory: worktreeA,
+    })
+    await bridgeA.start()
+    await bridgeA.prepareShellEnv(process.env)
+
+    const shellInvocationEnv: Record<string, string | undefined> = { ...process.env }
+    await bridgeA.prepareShellEnv(shellInvocationEnv, "git fetch origin")
+
+    const bridgeB = new PinentryBridge({
+      coordinator: coordinatorB,
+      socketDir: tmpDir,
+      directory: idleBackgroundDir,
+    })
+    await bridgeB.start()
+    await bridgeB.prepareShellEnv(process.env)
+
+    try {
+      expect(shellInvocationEnv.GIT_SSH_COMMAND?.endsWith("oc-yubikey-ssh")).toBe(true)
+      expect(isMatchingLocation({ directory: worktreeA }, { directory: symlinkToWorktreeA })).toBe(true)
+
+      const runViaGitSsh = async (
+        cwd: string | undefined,
+        withCustomEnv: boolean,
+      ): Promise<{ code: number; stdout: string; stderr: string }> => {
+        const proc = Bun.spawn(
+          ["sh", "-c", 'exec "$GIT_SSH_COMMAND" autodoc@autodoc.ghe.com "git-upload-pack repo.git"'],
+          {
+            ...(cwd ? { cwd } : {}),
+            ...(withCustomEnv ? { env: { ...process.env, GH_HOST: "autodoc.ghe.com" } } : {}),
+            stdout: "pipe",
+            stderr: "pipe",
+          },
+        )
+        const [stdout, stderr, code] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+          proc.exited,
+        ])
+        return { code, stdout: stdout.trim(), stderr: stderr.trim() }
+      }
+
+      const firstRun = await runViaGitSsh(worktreeA, true)
+      expect(firstRun.code).toBe(0)
+      expect(firstRun.stdout).toBe("ssh-mux-ok")
+      expect(requestedA.length).toBe(1)
+      expect(requestedA[0]?.fingerprint).toBe("SHA256:muxHardwareKey")
+      expect(requestedB.length).toBe(0)
+
+      const secondRun = await runViaGitSsh(worktreeSibling, false)
+      expect(secondRun.code).toBe(0)
+      expect(secondRun.stdout).toBe("ssh-mux-ok")
+      expect(requestedA.length).toBe(1)
+      expect(requestedB.length).toBe(0)
+
+      const noCwdAskpass = Bun.spawn(
+        ["sh", "-c", 'exec "$SSH_ASKPASS" "Confirm user presence for key ED25519-SK SHA256:noCwdTouch"'],
+        { stdout: "pipe", stderr: "pipe" },
+      )
+      expect(await noCwdAskpass.exited).toBe(0)
+      expect(requestedA.length).toBe(2)
+      expect(requestedA[1]?.fingerprint).toBe("SHA256:noCwdTouch")
+      expect(requestedB.length).toBe(0)
+    } finally {
+      coordinatorA.close()
+      coordinatorB.close()
+      await bridgeA.close()
+      await bridgeB.close()
+      for (const [k, v] of Object.entries(savedEnv)) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it("skips redundant PIN prompts in coordinator.unlock when gpg-agent already has the OpenPGP PIN cached", async () => {
+    const mockAgent = startMockGpgAgent({ expectedPin: "888888" })
+    await mockAgent.listen()
+
+    const requested: RequestSummary[] = []
+    const coordinator = new PinentryCoordinator({
+      agentSocketPath: mockAgent.socketPath,
+      async getCardStatus(): Promise<YubiKeyCardStatus> {
+        return {
+          connected: true,
+          serial: "23400176",
+          applicationID: "D2760001240100000006234001760000",
+          holder: "Yago Riveiro",
+          pinPolicy: "once",
+          pinRetries: { user: 3, reset: 0, admin: 3 },
+          uif: { sign: "off", decrypt: "off", auth: "off" },
+          keys: { signature: "111122223333444455556666777788889999AAAA" },
+        }
+      },
+      onRequested(summary) {
+        requested.push(summary)
+        setTimeout(() => {
+          coordinator.submit(summary.requestID, "888888")
+        }, 10)
+      },
+    })
+
+    try {
+      const firstUnlock = await coordinator.unlock({
+        reason: "Sign first commit",
+        allowRetry: true,
+      })
+      expect(firstUnlock.ok).toBe(true)
+      expect(requested.length).toBe(1)
+      expect(mockAgent.isPinCached()).toBe(true)
+
+      const secondUnlock = await coordinator.unlock({
+        reason: "Sign amended commit",
+        allowRetry: true,
+      })
+      expect(secondUnlock.ok).toBe(true)
+      expect(requested.length).toBe(1)
+    } finally {
+      coordinator.close()
+      await mockAgent.close()
     }
   })
 })

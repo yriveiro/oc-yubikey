@@ -18,6 +18,7 @@ import {
   parseSshAgentSignRequest,
   resolveGpgWrapperPath,
   resolvePinentryCliPath,
+  resolveSshWrapperPath,
 } from "./bridge.ts"
 import {
   PinentryCoordinator,
@@ -28,6 +29,7 @@ import {
 import {
   type LocationIdentity,
   isMatchingLocation,
+  normalizeCanonicalDirectory,
   sanitizeDisplayText,
 } from "./protocol.ts"
 import {
@@ -72,9 +74,11 @@ export {
   isAppleAgentSocket,
   isAppleLaunchdSshAgentSocket,
   isMatchingLocation,
+  normalizeCanonicalDirectory,
   parseSshAgentSignRequest,
   resolveGpgWrapperPath,
   resolvePinentryCliPath,
+  resolveSshWrapperPath,
   sanitizeDisplayText,
 }
 

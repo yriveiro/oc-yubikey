@@ -9,6 +9,8 @@ export {
   classifyAskpassPrompt,
   formatFriendlySshKeyType,
   parseSshAgentSignRequest,
+  resolveGpgWrapperPath,
   resolvePinentryCliPath,
+  resolveSshWrapperPath,
 } from "./src/index.ts"
 export * from "./src/yubikey.ts"
