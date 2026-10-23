@@ -8,6 +8,7 @@ import {
   assuanPercentEncode,
   encodeAssuanData,
   parseAssuanData,
+  parseOptionalInt,
 } from "./protocol.ts"
 import type { YubiKeyCardStatus, YubiKeyPinPolicy } from "./rpc.ts"
 
@@ -447,6 +448,92 @@ async function resolveCardAid(
   return {}
 }
 
+const ZERO_SHA512_HEX = "0".repeat(128)
+
+function normalizeOpenPgpAid(raw: string): string {
+  const upper = raw.trim().toUpperCase()
+  if (/^D27600012401[0-9A-F]{20}$/.test(upper)) {
+    return `${upper.slice(0, 12)}0000${upper.slice(16, 28)}0000`
+  }
+  return upper
+}
+
+interface OpenPgpKeyinfoCandidate {
+  readonly keygrip: string
+  readonly serialno: string
+  readonly flags?: string
+}
+
+function parseOpenPgpKeyinfoLine(rawLine: string): OpenPgpKeyinfoCandidate | undefined {
+  const parts = rawLine.replace(/^S\s+/i, "").trim().split(/\s+/)
+  if (parts[0]?.toUpperCase() !== "KEYINFO" || parts[2]?.toUpperCase() !== "T") {
+    return undefined
+  }
+  const keygrip = parts[1]
+  const serialno = parts[3]
+  if (!keygrip || !serialno || parts[4]?.toUpperCase() !== "OPENPGP.1") {
+    return undefined
+  }
+  if (!/^[0-9A-Fa-f]{16,64}$/.test(keygrip)) {
+    return undefined
+  }
+  const flags = parts[9]?.toUpperCase()
+  return { keygrip, serialno, ...(flags ? { flags } : {}) }
+}
+
+export function findOpenPgpSignatureKeygrip(
+  statusLines: ReadonlyArray<string>,
+  aid?: string,
+): string | undefined {
+  const candidates = statusLines
+    .map(parseOpenPgpKeyinfoLine)
+    .filter((item): item is OpenPgpKeyinfoCandidate => item !== undefined)
+
+  if (candidates.length === 0) return undefined
+
+  if (aid) {
+    const upperAid = aid.toUpperCase()
+    const normalizedAid = normalizeOpenPgpAid(aid)
+    const byAid =
+      candidates.find((c) => c.serialno.toUpperCase() === upperAid) ??
+      candidates.find((c) => normalizeOpenPgpAid(c.serialno) === normalizedAid)
+    if (byAid) return byAid.keygrip
+  }
+
+  const active = candidates.find((c) => c.flags === "A")
+  return active?.keygrip ?? (candidates.length === 1 ? candidates[0]?.keygrip : undefined)
+}
+
+async function verifyAndCachePinInAgent(
+  client: GpgAgentAssuanClient,
+  aid: string,
+  pin: string,
+): Promise<AssuanCommandResponse> {
+  const onInquire = (keyword: string) => {
+    if (keyword.startsWith("PASSPHRASE") || keyword.startsWith("PIN")) {
+      return pin
+    }
+    return undefined
+  }
+
+  const keyinfoRes = await client.command("KEYINFO --list")
+  const sigKeygrip = keyinfoRes.ok
+    ? findOpenPgpSignatureKeygrip(keyinfoRes.statusLines, aid)
+    : undefined
+
+  if (sigKeygrip) {
+    const sigKeyRes = await client.command(`SIGKEY ${sigKeygrip}`)
+    if (sigKeyRes.ok) {
+      const setHashRes = await client.command(`SETHASH 10 ${ZERO_SHA512_HEX}`)
+      if (setHashRes.ok) {
+        return client.command("PKSIGN", { onInquire })
+      }
+    }
+  }
+
+  return client.command(`SCD CHECKPIN ${aid}`, { onInquire })
+}
+
 async function sendPresetPassphrase(
   client: GpgAgentAssuanClient,
   keygrip: string,
@@ -462,10 +549,6 @@ async function sendPresetPassphrase(
   }
 }
 
-/**
- * Unlocks the YubiKey OpenPGP card in `gpg-agent` / `scdaemon` using in-process Assuan
- * loopback mode (`OPTION pinentry-mode=loopback` -> `SCD SERIALNO` -> `SCD CHECKPIN <aid>`).
- */
 export async function verifyYubiKeyPinLoopback(
   pin: string,
   options: {
@@ -513,17 +596,9 @@ export async function verifyYubiKeyPinLoopback(
       }
     }
 
-    const checkPinRes = await client.command(`SCD CHECKPIN ${aid}`, {
-      onInquire: (keyword) => {
-        if (keyword.startsWith("PASSPHRASE") || keyword.startsWith("PIN")) {
-          return pin
-        }
-        return undefined
-      },
-    })
-
-    if (!checkPinRes.ok) {
-      const parsed = parseCleanAssuanError(checkPinRes.error)
+    const verifyRes = await verifyAndCachePinInAgent(client, aid, pin)
+    if (!verifyRes.ok) {
+      const parsed = parseCleanAssuanError(verifyRes.error)
       return {
         ok: false,
         aid,
@@ -757,11 +832,6 @@ function parseColonHolder(cols: readonly string[]): string | undefined {
 function parseColonVendor(cols: readonly string[]): string | undefined {
   const name = cols[2] ? parseAssuanData(cols[2]).trim() : ""
   return name && name !== "?" ? name : undefined
-}
-
-function parseOptionalInt(raw: string | undefined): number | undefined {
-  const parsed = Number.parseInt(raw ?? "", 10)
-  return Number.isNaN(parsed) ? undefined : parsed
 }
 
 function applyColonReader(state: MutableCardStatus, cols: readonly string[]): void {

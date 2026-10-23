@@ -90,6 +90,11 @@ const TOUCH_PROMPT_RE =
 const KEY_TYPE_RE = /\b((?:ED25519|ECDSA)-SK|RSA|ED25519|ECDSA)\b/i
 const FINGERPRINT_RE = /\b(SHA256:[A-Za-z0-9+/=_-]+)\b/
 
+export function parseOptionalInt(raw: string | undefined): number | undefined {
+  const parsed = Number.parseInt(raw ?? "", 10)
+  return Number.isNaN(parsed) ? undefined : parsed
+}
+
 export function isSshFingerprint(value: string): value is SshFingerprint {
   return value.startsWith("SHA256:") && value.length > "SHA256:".length
 }

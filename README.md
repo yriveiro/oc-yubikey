@@ -26,9 +26,9 @@ Hardware-backed YubiKey commands (`git pull`, `git push`, `ssh`, `git commit -S`
 `oc-yubikey` solves both problems directly inside OpenCode:
 
 - **👆 Touch Your YubiKey Modal (`TouchModal`)**: Opens automatically with an audio chime when an SSH or OpenPGP operation awaits physical touch, displays the active command and key fingerprint, and **dismisses itself the instant you touch the YubiKey** (or aborts immediately if you press `Esc`).
-- **🔑 YubiKey PIN Modal (`PinentryModal`)**: Masked PIN input with retry counter warnings, card serial/holder metadata, and in-process `gpg-agent` Assuan loopback verification (`SCD CHECKPIN`) so your PIN never touches disk, shell history, or model context.
+- **🔑 YubiKey PIN Modal (`PinentryModal`)**: Masked PIN input with retry counter warnings, card serial/holder metadata, and in-process `gpg-agent` Assuan loopback verification (`PKSIGN` / `SCD CHECKPIN`) so your PIN never touches disk, shell history, or model context.
 
-### Quick Start (3 Steps)
+### Quick Start (2 Steps)
 
 1. **Register the plugin in `~/.config/opencode/opencode.jsonc`:**
 
@@ -41,26 +41,8 @@ Hardware-backed YubiKey commands (`git pull`, `git push`, `ssh`, `git commit -S`
 
    Replace `<owner>` with the GitHub account that hosts the plugin. A local checkout path (for example `"/path/to/oc-yubikey"`) also works during development.
 
-2. **Configure `~/.gnupg/gpg-agent.conf` and `~/.gnupg/gpg.conf`:**
-
-   In `~/.gnupg/gpg-agent.conf`:
-
-   ```ini
-   allow-loopback-pinentry
-   allow-preset-passphrase
-   pinentry-program /path/to/oc-yubikey/bin/oc-yubikey
-   ```
-
-   In `~/.gnupg/gpg.conf`, keep GnuPG's default `ask` pinentry mode and omit `pinentry-mode loopback`. `yubikey_unlock` sends `OPTION pinentry-mode=loopback` per connection over the Assuan socket. Leaving `pinentry-mode loopback` in `gpg.conf` forces `gpg` to skip `pinentry-program` and prompt on a terminal.
-
-   Reload `gpg-agent` after editing:
-
-   ```bash
-   gpg-connect-agent reloadagent /bye
-   ```
-
-3. **Verify inside OpenCode:**
-   Run `/yubikey status` in the TUI prompt or ask the agent to run `yubikey_status`.
+2. **Verify inside OpenCode:**
+   Run `/yubikey status` in the TUI prompt or ask the agent to run `yubikey_status`. `oc-yubikey` injects `bin/oc-yubikey-gpg` as `gpg.program` and `bin/oc-yubikey` as `SSH_ASKPASS`. You do not need to edit `~/.gnupg/gpg.conf` or `~/.gnupg/gpg-agent.conf`.
 
 ---
 
@@ -68,13 +50,13 @@ Hardware-backed YubiKey commands (`git pull`, `git push`, `ssh`, `git commit -S`
 
 ### Automatic Touch & PIN Triggers
 
-Every shell command spawned by OpenCode passes through `oc-yubikey`'s `shell.hook("create.before")` hook, which attaches an authenticated IPC channel and transparent `SSH_AUTH_SOCK` proxy:
+When `oc-yubikey` starts in `setup()`, it applies `prepareShellEnv(process.env)` and registers a `shell.hook("create.before")` hook. Both OpenCode shell commands and child processes spawned by other plugins inherit the authenticated IPC channel, `bin/oc-yubikey-gpg` wrapper, and transparent `SSH_AUTH_SOCK` proxy:
 
 | Operation | Trigger | TUI Modal | Resolution |
 | :--- | :--- | :--- | :--- |
 | `git pull`, `git fetch`, `git push`, `ssh` (FIDO2 `-sk` or OpenPGP SSH key) | `SSH2_AGENTC_SIGN_REQUEST` or `SSH_ASKPASS` | `TouchModal` / `PinentryModal` | Auto-closes on physical YubiKey touch (`SIGN_RESPONSE` / `SIGTERM`) or aborts on `Esc` |
-| `git commit -S`, `git tag -s`, `gpg --sign` | `gpg-agent` Assuan `CONFIRM` / `GETPIN` | `TouchModal` / `PinentryModal` | Auto-closes on physical touch or submits PIN over local IPC |
-| `/yubikey unlock` or `yubikey_unlock` tool | Direct Assuan loopback (`SCD CHECKPIN`) | `PinentryModal` | Verifies and caches OpenPGP PIN in `gpg-agent` |
+| `git commit -S`, `git tag -s`, `gpg --sign` | `bin/oc-yubikey-gpg` loopback `GET_HIDDEN` or `gpg-agent` Assuan `CONFIRM` / `GETPIN` | `TouchModal` / `PinentryModal` | Auto-closes on physical touch or submits PIN over local IPC |
+| `/yubikey unlock` or `yubikey_unlock` tool | Direct Assuan loopback (`PKSIGN` / `SCD CHECKPIN`) | `PinentryModal` | Verifies and caches OpenPGP PIN in `gpg-agent` |
 
 ### TUI Slash Commands & Command Palette
 
@@ -110,7 +92,7 @@ An OpenPGP smartcard always defines a user PIN (`PW1`) and a retry counter in DO
 All four tools are registered with `options: { codemode: false }` so the LLM must invoke them as explicit top-level tool calls:
 
 - **`yubikey_status`**: Inspects `gpg-agent` readiness and `gpg --card-status` metadata (reader, serial, Application ID, holder, signature count, signature PIN policy `once` / `always`, PIN retry counters `[user reset admin]`, and UIF touch policy).
-- **`yubikey_unlock`**: Opens the TUI `PinentryModal` and verifies the user's PIN directly against `gpg-agent` (`OPTION pinentry-mode=loopback` → `SCD SERIALNO` → `SCD CHECKPIN <aid>`). The PIN is never returned to the LLM.
+- **`yubikey_unlock`**: Opens the TUI `PinentryModal` and verifies and caches the user's PIN directly in `gpg-agent` (`OPTION pinentry-mode=loopback` → `SCD SERIALNO` → `KEYINFO --list` → `SIGKEY <sigKeygrip>` → `SETHASH 10 <zero-hash>` → `PKSIGN`, with fallback to `SCD CHECKPIN <aid>`). The PIN is never returned to the LLM.
 - **`yubikey_touch`**: Triggers a hardware FIDO2 user-presence challenge (`ssh-keygen -Y sign` against `~/.ssh/id_*_sk`), opens `TouchModal` in the TUI, and resolves automatically when the user physically touches the YubiKey.
 - **`yubikey_lock`**: Clears cached PIN state in `scdaemon` and reloads `gpg-agent` (`SCD RESET` + `RELOADAGENT`).
 
@@ -143,7 +125,7 @@ flowchart TB
 
   TUI <-->|"Typed RPC (src/rpc.ts)\nprompt / settled / submit / cancel"| Coord
   Coord <--> Bridge
-  Coord -->|"Assuan Loopback\nSCD CHECKPIN"| Assuan
+  Coord -->|"Assuan Loopback\nPKSIGN / SCD CHECKPIN"| Assuan
   Assuan <-->|"~/.gnupg/S.gpg-agent"| GpgAgent
 
   Bridge -.->|"shell.hook('create.before')\nSSH_AUTH_SOCK + SSH_ASKPASS + OC_YUBIKEY_TOKEN"| ShellCmd
@@ -241,10 +223,12 @@ sequenceDiagram
   GPG-->>Assuan: OK
   Assuan->>GPG: SCD SERIALNO
   GPG-->>Assuan: S SERIALNO D2760001240103040006123456780000
-  Assuan->>GPG: SCD CHECKPIN D2760001240103040006123456780000
+  Assuan->>GPG: KEYINFO --list
+  GPG-->>Assuan: S KEYINFO <sigKeygrip> T <aid> OPENPGP.1 - - - - A
+  Assuan->>GPG: SIGKEY <sigKeygrip> + SETHASH 10 <64-byte-zero-hex> + PKSIGN
   GPG-->>Assuan: INQUIRE PASSPHRASE
   Assuan->>GPG: D <percent-encoded-pin> + END
-  GPG-->>Assuan: OK
+  GPG-->>Assuan: D (7:sig-val...) + OK
   Assuan-->>Coord: { ok: true }
 ```
 
@@ -269,7 +253,7 @@ stateDiagram-v2
 
 | Control | Implementation |
 | :--- | :--- |
-| **Zero Model Exposure** | `yubikey_unlock` verifies the PIN inside the server process via Assuan loopback (`SCD CHECKPIN`) and returns only `{ ok, message, card }`. The raw `promptPin` RPC is disabled by default unless `allowRawPinRpc: true` is explicitly configured. |
+| **Zero Model Exposure** | `yubikey_unlock` verifies and caches the PIN inside the server process via Assuan loopback (`PKSIGN` / `SCD CHECKPIN`) and returns only `{ ok, message, card }`. The raw `promptPin` RPC is disabled by default unless `allowRawPinRpc: true` is explicitly configured. |
 | **Per-Instance 256-bit IPC Token Auth** | `PinentryBridge` generates a 32-byte cryptographic token (`randomBytes(32).toString("hex")`) per instance and verifies every IPC connection using `crypto.timingSafeEqual`. Unauthenticated local sockets are rejected before reaching `PinentryCoordinator`. |
 | **Socket & Directory Ownership Verification** | `/tmp/oc-yk-<uid>` (`0700`), `ipc-<id>.sock` (`0600`), `active.json` (`0600`), and upstream `gpg-agent` / `SSH_AUTH_SOCK` paths are verified via `lstatSync` to reject symlinks, non-sockets, foreign UIDs, and group/world permissions (`mode & 0o077`). |
 | **Atomic Pointer Updates** | `active.json` is written via an exclusive temporary file (`flag: "wx"`, `mode: 0o600`) and atomically renamed into place, then removed on `bridge.close()`. |

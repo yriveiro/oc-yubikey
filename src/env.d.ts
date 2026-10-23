@@ -23,7 +23,7 @@ declare namespace NodeJS {
   }
   interface ReadableStream {
     on(event: "data", listener: (chunk: Buffer | string) => void): this
-    on(event: "end", listener: () => void): this
+    on(event: "end" | "error", listener: () => void): this
   }
   interface Timeout {
     unref?(): this
@@ -159,6 +159,7 @@ declare module "node:child_process" {
     readonly stdin: WritableStream & { end(): void }
     readonly stdout: ReadableStream
     readonly stderr: ReadableStream
+    readonly stdio: readonly (ReadableStream | WritableStream | null | undefined)[]
     kill(signal?: string): boolean
     on(event: "error", listener: (err: Error) => void): this
     on(event: "close" | "exit", listener: (code: number | null) => void): this

@@ -13,6 +13,7 @@ import {
   findSshSecurityKeyFile,
   isAppleLaunchdSshAgentSocket,
   parseSshAgentSignRequest,
+  resolveGpgWrapperPath,
   resolvePinentryCliPath,
 } from "../src/bridge.ts"
 import { PinentryCoordinator, type PromptOutputByKind } from "../src/coordinator.ts"
@@ -27,6 +28,7 @@ import type {
 import {
   assuanPercentDecode,
   assuanPercentEncode,
+  findOpenPgpSignatureKeygrip,
   formatCardStatusReport,
   inspectGpgConfiguration,
   lockYubiKey,
@@ -51,14 +53,18 @@ export type TypeLevelInvariantChecks = [
 
 interface MockAssuanConnectionState {
   awaitingInquire: boolean
+  inquireCommand?: "PKSIGN" | "CHECKPIN"
   currentInquirePin: string
+  readonly aid: string
+  readonly sigKeygrip: string | null
+  readonly expectedPin: string
+  readonly receivedInquireData: string[]
+  pinCachedInAgent: boolean
 }
 
 function handleMockInquireLine(
   line: string,
   state: MockAssuanConnectionState,
-  expectedPin: string,
-  receivedInquireData: string[],
   socket: net.Socket,
 ): void {
   if (line.startsWith("D ")) {
@@ -66,15 +72,23 @@ function handleMockInquireLine(
     return
   }
   if (line === "END") {
+    const cmd = state.inquireCommand
     state.awaitingInquire = false
-    receivedInquireData.push(state.currentInquirePin)
-    const ok = state.currentInquirePin === expectedPin
+    state.inquireCommand = undefined
+    state.receivedInquireData.push(state.currentInquirePin)
+    const ok = state.currentInquirePin === state.expectedPin
     state.currentInquirePin = ""
-    socket.write(ok ? "OK\n" : "ERR 100663404 Bad PIN <SCD>\n")
+    if (ok) {
+      if (cmd === "PKSIGN") state.pinCachedInAgent = true
+      socket.write(cmd === "PKSIGN" ? "D (7:sig-val)\nOK\n" : "OK\n")
+    } else {
+      socket.write("ERR 100663404 Bad PIN <SCD>\n")
+    }
     return
   }
   if (line === "CAN") {
     state.awaitingInquire = false
+    state.inquireCommand = undefined
     state.currentInquirePin = ""
     socket.write("ERR 83886179 Operation cancelled <Pinentry>\n")
   }
@@ -83,15 +97,23 @@ function handleMockInquireLine(
 function handleMockCommandLine(
   line: string,
   state: MockAssuanConnectionState,
-  aid: string,
   socket: net.Socket,
 ): void {
   if (line === "SCD SERIALNO") {
-    socket.write(`S SERIALNO ${aid} 0\nOK\n`)
+    socket.write(`S SERIALNO ${state.aid} 0\nOK\n`)
     return
   }
-  if (line.startsWith("SCD CHECKPIN ")) {
+  if (line === "KEYINFO --list") {
+    const cachedFlag = state.pinCachedInAgent ? "1" : "-"
+    const keyinfoLine = state.sigKeygrip
+      ? `S KEYINFO ${state.sigKeygrip} T ${state.aid} OPENPGP.1 ${cachedFlag} - - - A\n`
+      : ""
+    socket.write(`${keyinfoLine}OK\n`)
+    return
+  }
+  if (line === "PKSIGN" || line.startsWith("SCD CHECKPIN ")) {
     state.awaitingInquire = true
+    state.inquireCommand = line === "PKSIGN" ? "PKSIGN" : "CHECKPIN"
     socket.write("S INQUIRE_MAXLEN 100\nINQUIRE PASSPHRASE\n")
     return
   }
@@ -105,23 +127,28 @@ function handleMockCommandLine(
 function startMockGpgAgent(options: {
   expectedPin?: string
   aid?: string
+  sigKeygrip?: string | null
   onCommand?: (cmd: string) => void
 }) {
   const tmpDir = mkdtempSync(path.join(os.tmpdir(), "oc-mock-gpg-agent-"))
   const socketPath = path.join(tmpDir, "S.gpg-agent")
-  const aid = options.aid ?? "D2760001240103040006123456780000"
-  const expectedPin = options.expectedPin ?? "123456"
   const receivedCommands: string[] = []
-  const receivedInquireData: string[] = []
+  const state: MockAssuanConnectionState = {
+    awaitingInquire: false,
+    currentInquirePin: "",
+    aid: options.aid ?? "D2760001240103040006123456780000",
+    sigKeygrip:
+      options.sigKeygrip === undefined
+        ? "111122223333444455556666777788889999AAAA"
+        : options.sigKeygrip,
+    expectedPin: options.expectedPin ?? "123456",
+    receivedInquireData: [],
+    pinCachedInAgent: false,
+  }
 
   const server = net.createServer((socket) => {
     socket.write("OK Pleased to meet you, mock gpg-agent\n")
     let buffer = ""
-    const state: MockAssuanConnectionState = {
-      awaitingInquire: false,
-      currentInquirePin: "",
-    }
-
     socket.on("data", (chunk: Buffer | string) => {
       buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8")
       let idx = buffer.indexOf("\n")
@@ -129,15 +156,13 @@ function startMockGpgAgent(options: {
         const line = buffer.slice(0, idx).replace(/\r$/, "")
         buffer = buffer.slice(idx + 1)
         idx = buffer.indexOf("\n")
-
         if (state.awaitingInquire) {
-          handleMockInquireLine(line, state, expectedPin, receivedInquireData, socket)
+          handleMockInquireLine(line, state, socket)
           continue
         }
-
         receivedCommands.push(line)
         options.onCommand?.(line)
-        handleMockCommandLine(line, state, aid, socket)
+        handleMockCommandLine(line, state, socket)
       }
     })
   })
@@ -145,7 +170,8 @@ function startMockGpgAgent(options: {
   return {
     socketPath,
     receivedCommands,
-    receivedInquireData,
+    receivedInquireData: state.receivedInquireData,
+    isPinCached: () => state.pinCachedInAgent,
     async listen() {
       await new Promise<void>((resolve, reject) => {
         server.once("error", reject)
@@ -168,7 +194,7 @@ describe("Direct gpg-agent Assuan loopback client", () => {
     expect(assuanPercentDecode(encoded)).toBe(raw)
   })
 
-  it("unlocks YubiKey via OPTION pinentry-mode=loopback -> SCD SERIALNO -> SCD CHECKPIN -> INQUIRE PASSPHRASE", async () => {
+  it("warms gpg-agent signing cache via KEYINFO --list -> SIGKEY -> SETHASH 10 -> PKSIGN", async () => {
     const mockAgent = startMockGpgAgent({ expectedPin: "654321%!" })
     await mockAgent.listen()
 
@@ -179,13 +205,51 @@ describe("Direct gpg-agent Assuan loopback client", () => {
 
       expect(res.ok).toBe(true)
       expect(res.aid).toBe("D2760001240103040006123456780000")
+      expect(mockAgent.isPinCached()).toBe(true)
       expect(mockAgent.receivedCommands).toEqual([
         "OPTION pinentry-mode=loopback",
         "SCD SERIALNO",
-        "SCD CHECKPIN D2760001240103040006123456780000",
+        "KEYINFO --list",
+        "SIGKEY 111122223333444455556666777788889999AAAA",
+        `SETHASH 10 ${"0".repeat(128)}`,
+        "PKSIGN",
         "BYE",
       ])
       expect(mockAgent.receivedInquireData).toEqual(["654321%!"])
+    } finally {
+      await mockAgent.close()
+    }
+  })
+
+  it("falls back to SCD CHECKPIN when KEYINFO --list has no OPENPGP.1 signature keygrip and matches masked AIDs", async () => {
+    const mockAgent = startMockGpgAgent({
+      expectedPin: "654321%!",
+      sigKeygrip: null,
+    })
+    await mockAgent.listen()
+
+    try {
+      const res = await verifyYubiKeyPinLoopback("654321%!", {
+        socketPath: mockAgent.socketPath,
+      })
+
+      expect(res.ok).toBe(true)
+      expect(mockAgent.receivedCommands).toEqual([
+        "OPTION pinentry-mode=loopback",
+        "SCD SERIALNO",
+        "KEYINFO --list",
+        "SCD CHECKPIN D2760001240103040006123456780000",
+        "BYE",
+      ])
+
+      const matched = findOpenPgpSignatureKeygrip(
+        [
+          "KEYINFO AAAABBBBCCCCDDDDEEEEFFFF0000111122223333 T D2760001240100000006876543210000 OPENPGP.1 - - - - -",
+          "KEYINFO 111122223333444455556666777788889999AAAA T D2760001240100000006123456780000 OPENPGP.1 - - - - A",
+        ],
+        "D2760001240103040006123456780000",
+      )
+      expect(matched).toBe("111122223333444455556666777788889999AAAA")
     } finally {
       await mockAgent.close()
     }
@@ -1270,6 +1334,178 @@ describe("GnuPG configuration and shell environment", () => {
         `Warning: gpg-agent.conf pinentry-program does not exist: ${path.join(tmpDir, "missing-pinentry")}`,
       )
     } finally {
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it("injects bin/oc-yubikey-gpg via GIT_CONFIG_* idempotently and intercepts loopback PIN inquiries during git commit -S", async () => {
+    const baseTmp = existsSync("/tmp") ? "/tmp" : os.tmpdir()
+    const tmpDir = mkdtempSync(path.join(baseTmp, "oc-gpg-wrapper-"))
+    const mockGpg = path.join(tmpDir, "mock-gpg")
+    writeFileSync(
+      mockGpg,
+      `#!/bin/sh
+cat >/dev/null
+echo "[GNUPG:] USERID_HINT 777788889999AAAA Jane Doe <jane@example.com>" >&2
+echo "[GNUPG:] NEED_PASSPHRASE_PIN 0 0 0" >&2
+echo "[GNUPG:] INQUIRE_MAXLEN 100" >&2
+echo "[GNUPG:] GET_HIDDEN passphrase.enter" >&2
+IFS= read -r pin <&3
+if [ "$pin" != "246810" ]; then
+  echo "[GNUPG:] BAD_PASSPHRASE" >&2
+  exit 2
+fi
+echo "[GNUPG:] GOT_IT" >&2
+echo "[GNUPG:] SIG_CREATED D 22 10 00 1700000000 111122223333444455556666777788889999AAAA" >&2
+cat <<'EOF'
+-----BEGIN PGP SIGNATURE-----
+
+iHUEABYKAB0WIQQRVkaqpdaQy202rLj2Vl8yobe2lGQUCZ32p0gAKCRCVl8yobe2l
+GTestSignatureDataHere==
+=1234
+-----END PGP SIGNATURE-----
+EOF
+`,
+      { mode: 0o755 },
+    )
+    chmodSync(mockGpg, 0o755)
+
+    const requested: RequestSummary[] = []
+    const coordinator = new PinentryCoordinator({
+      onRequested(summary) {
+        requested.push(summary)
+        setTimeout(() => {
+          coordinator.submit(summary.requestID, "246810")
+        }, 15)
+      },
+    })
+    const bridge = new PinentryBridge({ coordinator, socketDir: tmpDir })
+    await bridge.start()
+
+    try {
+      const env: Record<string, string | undefined> = {
+        ...process.env,
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: "user.signingkey",
+        GIT_CONFIG_VALUE_0: "111122223333444455556666777788889999AAAA",
+        OC_YUBIKEY_GPG_BIN: mockGpg,
+      }
+      await bridge.prepareShellEnv(env, "git commit -S -m test")
+      await bridge.prepareShellEnv(env, "git commit -S -m test")
+
+      expect(env.GIT_CONFIG_COUNT).toBe("2")
+      expect(env.GIT_CONFIG_KEY_0).toBe("user.signingkey")
+      expect(env.GIT_CONFIG_KEY_1).toBe("gpg.program")
+      expect(env.GIT_CONFIG_VALUE_1).toBe(resolveGpgWrapperPath())
+
+      const runGit = (args: string[]) =>
+        new Promise<{ code: number; stdout: string }>((resolve) => {
+          const child = spawn("git", ["-C", tmpDir, ...args], {
+            env,
+            stdio: ["ignore", "pipe", "pipe"],
+          })
+          let stdout = ""
+          child.stdout.on("data", (c) => {
+            stdout += String(c)
+          })
+          child.on("close", (code) => resolve({ code: code ?? 1, stdout }))
+        })
+
+      await runGit(["init"])
+      await runGit(["config", "user.name", "Jane Doe"])
+      await runGit(["config", "user.email", "jane@example.com"])
+
+      const commitRes = await runGit(["commit", "--allow-empty", "-S", "-m", "signed commit"])
+      expect(commitRes.code).toBe(0)
+      expect(requested.length).toBe(1)
+      expect(requested[0]?.kind).toBe("pin")
+      expect(requested[0]?.description).toContain("Jane Doe <jane@example.com>")
+      expect(requested[0]?.command).toBe("git commit -S -m test")
+
+      const catRes = await runGit(["cat-file", "-p", "HEAD"])
+      expect(catRes.stdout).toContain("-----BEGIN PGP SIGNATURE-----")
+    } finally {
+      coordinator.close()
+      await bridge.close()
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it("propagates oc-yubikey env vars to process.env for non-shell plugin spawns and restores them on close", async () => {
+    const baseTmp = existsSync("/tmp") ? "/tmp" : os.tmpdir()
+    const tmpDir = mkdtempSync(path.join(baseTmp, "oc-proc-env-"))
+    const savedEnv = {
+      OC_YUBIKEY_SOCK: process.env.OC_YUBIKEY_SOCK,
+      OC_YUBIKEY_TOKEN: process.env.OC_YUBIKEY_TOKEN,
+      PINENTRY_USER_DATA: process.env.PINENTRY_USER_DATA,
+      SSH_ASKPASS: process.env.SSH_ASKPASS,
+      GIT_CONFIG_COUNT: process.env.GIT_CONFIG_COUNT,
+      GIT_CONFIG_KEY_0: process.env.GIT_CONFIG_KEY_0,
+      GIT_CONFIG_VALUE_0: process.env.GIT_CONFIG_VALUE_0,
+    }
+
+    delete process.env.OC_YUBIKEY_SOCK
+    delete process.env.OC_YUBIKEY_TOKEN
+    delete process.env.PINENTRY_USER_DATA
+    delete process.env.SSH_ASKPASS
+    delete process.env.GIT_CONFIG_COUNT
+    delete process.env.GIT_CONFIG_KEY_0
+    delete process.env.GIT_CONFIG_VALUE_0
+
+    const ownerRequested: RequestSummary[] = []
+    const otherRequested: RequestSummary[] = []
+    const ownerCoordinator = new PinentryCoordinator({
+      onRequested(summary) {
+        ownerRequested.push(summary)
+        setTimeout(() => ownerCoordinator.confirmTouch(summary.requestID), 15)
+      },
+    })
+    const otherCoordinator = new PinentryCoordinator({
+      onRequested(summary) {
+        otherRequested.push(summary)
+      },
+    })
+
+    const ownerBridge = new PinentryBridge({ coordinator: ownerCoordinator, socketDir: tmpDir })
+    const otherBridge = new PinentryBridge({ coordinator: otherCoordinator, socketDir: tmpDir })
+
+    try {
+      await ownerBridge.start()
+      await ownerBridge.prepareShellEnv(process.env)
+      await otherBridge.start()
+
+      expect(process.env.OC_YUBIKEY_SOCK).toBe(ownerBridge.socketPath)
+      expect(process.env.SSH_ASKPASS).toBe(resolvePinentryCliPath())
+      expect(process.env.GIT_CONFIG_KEY_0).toBe("gpg.program")
+      expect(process.env.GIT_CONFIG_VALUE_0).toBe(resolveGpgWrapperPath())
+
+      const askpassExitCode = await new Promise<number>((resolve) => {
+        const child = spawn(
+          process.env.SSH_ASKPASS!,
+          ["Confirm user presence for key ED25519-SK SHA256:nonShellSpawn"],
+          { stdio: ["ignore", "pipe", "pipe"] },
+        )
+        child.on("close", (code) => resolve(code ?? 1))
+      })
+
+      expect(askpassExitCode).toBe(0)
+      expect(ownerRequested.length).toBe(1)
+      expect(ownerRequested[0]?.fingerprint).toBe("SHA256:nonShellSpawn")
+      expect(otherRequested.length).toBe(0)
+
+      await ownerBridge.close()
+      expect(process.env.OC_YUBIKEY_SOCK).toBeUndefined()
+      expect(process.env.SSH_ASKPASS).toBeUndefined()
+      expect(process.env.GIT_CONFIG_COUNT).toBeUndefined()
+    } finally {
+      ownerCoordinator.close()
+      otherCoordinator.close()
+      await ownerBridge.close()
+      await otherBridge.close()
+      for (const [k, v] of Object.entries(savedEnv)) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
       rmSync(tmpDir, { recursive: true, force: true })
     }
   })

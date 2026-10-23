@@ -7,6 +7,7 @@ import {
   classifyAskpassPrompt,
   encodeAssuanData,
   parseAssuanData,
+  parseOptionalInt,
   resolveIpcTarget,
 } from "./protocol.ts"
 
@@ -140,19 +141,31 @@ function isSafeFallbackExecutable(binPath: string, selfPaths: ReadonlySet<string
   }
 }
 
+import type { ReadableStream, WritableStream } from "node:stream"
+
+function collectSelfPaths(): Set<string> {
+  const cliFile = fileURLToPath(import.meta.url)
+  const binDir = path.resolve(path.dirname(cliFile), "..", "bin")
+  const candidates = [
+    cliFile,
+    path.join(binDir, "oc-yubikey"),
+    path.join(binDir, "oc-yubikey-gpg"),
+  ]
+  const selfPaths = new Set<string>()
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      selfPaths.add(realpathSync(candidate))
+    }
+  }
+  return selfPaths
+}
+
 function spawnFallbackPinentry(args: readonly string[]): boolean {
   if (process.env.OC_YUBIKEY_FALLBACK_ACTIVE === "1") {
     return false
   }
 
-  const selfPaths = new Set<string>()
-  try {
-    const cliFile = fileURLToPath(import.meta.url)
-    selfPaths.add(realpathSync(cliFile))
-    selfPaths.add(realpathSync(path.resolve(path.dirname(cliFile), "..", "bin", "oc-yubikey")))
-  } catch {
-    // Ignore resolution errors
-  }
+  const selfPaths = collectSelfPaths()
 
   const candidates = [
     process.env.OC_FALLBACK_PINENTRY,
@@ -175,6 +188,235 @@ function spawnFallbackPinentry(args: readonly string[]): boolean {
     }
   }
   return false
+}
+
+function resolveRealGpgExecutable(): string {
+  const selfPaths = collectSelfPaths()
+  const candidates = [
+    process.env.OC_YUBIKEY_GPG_BIN,
+    "/opt/homebrew/bin/gpg",
+    "/usr/local/MacGPG2/bin/gpg",
+    "/usr/local/bin/gpg",
+    "/usr/bin/gpg",
+  ].filter((item): item is string => Boolean(item))
+
+  for (const bin of candidates) {
+    if (isSafeFallbackExecutable(bin, selfPaths)) {
+      return realpathSync(bin)
+    }
+  }
+  return "gpg"
+}
+
+const PASSPHRASE_INPUT_FLAGS = new Set<string>([
+  "--command-fd",
+  "--passphrase-fd",
+  "--passphrase",
+  "--passphrase-file",
+])
+
+function isPassphraseInputFlag(arg: string): boolean {
+  const eqIdx = arg.indexOf("=")
+  const flag = eqIdx === -1 ? arg : arg.slice(0, eqIdx)
+  return PASSPHRASE_INPUT_FLAGS.has(flag)
+}
+
+interface InspectedGpgArgs {
+  readonly hasCustomPassphraseInput: boolean
+  readonly hasPinentryMode: boolean
+  readonly callerStatusFd: number | undefined
+}
+
+function inspectGpgWrapperArgs(args: readonly string[]): InspectedGpgArgs {
+  let hasCustomPassphraseInput = false
+  let hasPinentryMode = false
+  let callerStatusFd: number | undefined
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (!arg || arg === "--") break
+    if (isPassphraseInputFlag(arg)) {
+      hasCustomPassphraseInput = true
+    } else if (arg === "--pinentry-mode" || arg.startsWith("--pinentry-mode=")) {
+      hasPinentryMode = true
+    } else if (arg === "--status-fd") {
+      callerStatusFd = parseOptionalInt(args[i + 1]) ?? callerStatusFd
+      i += 1
+    } else if (arg.startsWith("--status-fd=")) {
+      callerStatusFd = parseOptionalInt(arg.slice("--status-fd=".length)) ?? callerStatusFd
+    }
+  }
+
+  return { hasCustomPassphraseInput, hasPinentryMode, callerStatusFd }
+}
+
+function buildWrappedGpgArgs(
+  args: readonly string[],
+  inspected: InspectedGpgArgs,
+  useDedicatedStatusPipe: boolean,
+): string[] {
+  const gpgArgs: string[] = []
+  if (!inspected.hasPinentryMode) {
+    gpgArgs.push("--pinentry-mode", "loopback")
+  }
+  gpgArgs.push("--command-fd", "3")
+  if (useDedicatedStatusPipe) {
+    gpgArgs.push("--status-fd", "4")
+  }
+  gpgArgs.push(...args)
+  return gpgArgs
+}
+
+interface GpgStatusMonitorOptions {
+  readonly socketPath: string
+  readonly token: string
+  readonly command: string | undefined
+  readonly commandStream: WritableStream | undefined
+  readonly onActiveRequest: (req: ActiveIpcHandle | null) => void
+}
+
+async function promptGpgLoopbackPin(
+  options: GpgStatusMonitorOptions,
+  userIdHint: string | undefined,
+  error: string | undefined,
+): Promise<void> {
+  const req = sendIpcRequest(options.socketPath, {
+    token: options.token,
+    type: "pin",
+    title: "YubiKey PIN Entry",
+    description: userIdHint
+      ? `Enter your YubiKey OpenPGP PIN for ${userIdHint}`
+      : "Enter your YubiKey OpenPGP PIN to sign",
+    prompt: "PIN:",
+    ...(error ? { error } : {}),
+    ...(options.command ? { command: options.command } : {}),
+  })
+  options.onActiveRequest(req)
+
+  const res = await req.promise.catch(
+    (): CliIpcResponsePayload => ({ ok: false, cancelled: true }),
+  )
+  options.onActiveRequest(null)
+  if (res.ok && !res.cancelled && typeof res.pin === "string") {
+    options.commandStream?.write(`${res.pin}\n`)
+    return
+  }
+  options.commandStream?.write("\x04\n")
+  options.commandStream?.end()
+}
+
+function createGpgStatusMonitor(options: GpgStatusMonitorOptions): (chunk: Buffer | string) => void {
+  let statusBuffer = ""
+  let userIdHint: string | undefined
+  let lastError: string | undefined
+  const statusQueue: string[] = []
+  let draining = false
+
+  const handleStatusLine = async (line: string): Promise<void> => {
+    const body = line.slice("[GNUPG:] ".length).trim()
+    if (body.startsWith("USERID_HINT ")) {
+      const firstSpace = body.indexOf(" ", "USERID_HINT ".length)
+      userIdHint = firstSpace !== -1 ? body.slice(firstSpace + 1).trim() || undefined : undefined
+    } else if (body.startsWith("BAD_PASSPHRASE")) {
+      lastError = "Bad PIN"
+    } else if (body.startsWith("GET_HIDDEN passphrase.")) {
+      const error = lastError
+      lastError = undefined
+      await promptGpgLoopbackPin(options, userIdHint, error)
+      options.onActiveRequest(null)
+    }
+  }
+
+  const drain = async (): Promise<void> => {
+    if (draining) return
+    draining = true
+    while (statusQueue.length > 0) {
+      const next = statusQueue.shift()
+      if (next) await handleStatusLine(next)
+    }
+    draining = false
+  }
+
+  return (chunk: Buffer | string): void => {
+    statusBuffer += typeof chunk === "string" ? chunk : chunk.toString("utf8")
+    let idx = statusBuffer.indexOf("\n")
+    while (idx !== -1) {
+      const line = statusBuffer.slice(0, idx).replace(/\r$/, "")
+      statusBuffer = statusBuffer.slice(idx + 1)
+      idx = statusBuffer.indexOf("\n")
+      if (line.startsWith("[GNUPG:] ")) {
+        statusQueue.push(line)
+      }
+    }
+    void drain()
+  }
+}
+
+function runGpgWrapperMode(args: readonly string[]): void {
+  const gpgBin = resolveRealGpgExecutable()
+  const childEnv: Record<string, string | undefined> = { ...process.env }
+  delete childEnv.OC_YUBIKEY_MODE
+
+  const { socketPath, token, command } = resolveIpcTarget()
+  const inspected = inspectGpgWrapperArgs(args)
+
+  if (!socketPath || !token || !existsSync(socketPath) || inspected.hasCustomPassphraseInput) {
+    const child = spawn(gpgBin, [...args], { stdio: "inherit", env: childEnv })
+    child.on("exit", (code) => process.exit(code ?? 1))
+    child.on("error", () => process.exit(127))
+    return
+  }
+
+  const useDedicatedStatusPipe = inspected.callerStatusFd !== 1 && inspected.callerStatusFd !== 2
+  const gpgArgs = buildWrappedGpgArgs(args, inspected, useDedicatedStatusPipe)
+  const child = spawn(gpgBin, gpgArgs, {
+    env: childEnv,
+    stdio: useDedicatedStatusPipe
+      ? ["pipe", "pipe", "pipe", "pipe", "pipe"]
+      : ["pipe", "pipe", "pipe", "pipe"],
+  })
+
+  let activePinRequest: ActiveIpcHandle | null = null
+  registerSignalCleanup(() => {
+    activePinRequest?.close()
+    child.kill("SIGTERM")
+    process.exit(130)
+  })
+
+  process.stdin.on("data", (chunk: Buffer | string) => child.stdin.write(chunk))
+  process.stdin.on("end", () => child.stdin.end())
+  process.stdin.on("error", () => child.stdin.end())
+
+  const onStatusChunk = createGpgStatusMonitor({
+    socketPath,
+    token,
+    command,
+    commandStream: child.stdio[3] as WritableStream | undefined,
+    onActiveRequest: (req) => {
+      activePinRequest = req
+    },
+  })
+
+  child.stdout.on("data", (chunk: Buffer | string) => {
+    if (inspected.callerStatusFd === 1) onStatusChunk(chunk)
+    process.stdout.write(chunk)
+  })
+  child.stderr.on("data", (chunk: Buffer | string) => {
+    if (inspected.callerStatusFd === 2) onStatusChunk(chunk)
+    process.stderr.write(chunk)
+  })
+  if (useDedicatedStatusPipe) {
+    ;(child.stdio[4] as ReadableStream | undefined)?.on("data", onStatusChunk)
+  }
+
+  child.on("error", () => {
+    activePinRequest?.close()
+    process.exit(127)
+  })
+  child.on("close", (code) => {
+    activePinRequest?.close()
+    process.exit(code ?? 1)
+  })
 }
 
 interface AssuanPinentryState {
@@ -420,9 +662,18 @@ function extractPositionalPrompt(args: readonly string[]): string | null {
 }
 
 const rawArgs = process.argv.slice(2)
-const positionalPrompt = extractPositionalPrompt(rawArgs)
-if (positionalPrompt !== null) {
-  void runAskpassMode(positionalPrompt)
+const isGpgWrapperInvocation =
+  process.env.OC_YUBIKEY_MODE === "gpg" ||
+  path.basename(process.argv[1] ?? "") === "oc-yubikey-gpg" ||
+  rawArgs[0] === "--gpg-wrapper"
+
+if (isGpgWrapperInvocation) {
+  runGpgWrapperMode(rawArgs[0] === "--gpg-wrapper" ? rawArgs.slice(1) : rawArgs)
 } else {
-  runAssuanPinentryMode(rawArgs)
+  const positionalPrompt = extractPositionalPrompt(rawArgs)
+  if (positionalPrompt !== null) {
+    void runAskpassMode(positionalPrompt)
+  } else {
+    runAssuanPinentryMode(rawArgs)
+  }
 }
