@@ -13,6 +13,7 @@ import {
   setProp,
 } from "@opentui/solid"
 import { createSignal, onCleanup, onMount } from "solid-js"
+import { isMatchingLocation } from "./protocol.ts"
 import { Pinentry, type RequestSummary } from "./rpc.ts"
 
 const MAX_TUI_PIN_LENGTH = 128
@@ -649,11 +650,21 @@ function buildKeymapCommands(actions: TuiCommandActions): readonly KeymapCommand
   ]
 }
 
+function resolveActiveTuiLocation(context: Context): LocationRef {
+  if (context.location?.directory) return context.location
+  const route = context.ui.router?.current?.()
+  if (route?.type === "session" && typeof route.sessionID === "string") {
+    const sessionLoc = context.data.session?.get?.(route.sessionID)?.location
+    if (sessionLoc?.directory) return sessionLoc
+  }
+  return context.data.location.default()
+}
+
 export default Plugin.define({
   id: "oc-yubikey.tui",
   setup(context) {
     const rpc = context.client.rpc(Pinentry)
-    const getLocation = () => context.location ?? context.data.location.default()
+    const getLocation = () => resolveActiveTuiLocation(context)
 
     const [genStore, updateGenStore] = context.storage.memory<{ generation: number }>("lifecycle", {
       initial: { generation: 0 },
@@ -710,7 +721,7 @@ export default Plugin.define({
     }
 
     const handleRequested = (req: QueuedRequest) => {
-      if (!isCurrentGen()) return
+      if (!isCurrentGen() || !isMatchingLocation(req.location, getLocation())) return
       let added = false
       setPendingQueue((prev) => {
         if (prev.some((item) => item.requestID === req.requestID)) return prev
@@ -762,7 +773,7 @@ export default Plugin.define({
       if (!isCurrentGen()) return
       if (details.type === "rpc.oc-yubikey.prompt") {
         const data = details.data as RequestSummary
-        handleRequested({ ...data, location: details.location ?? getLocation() })
+        handleRequested({ ...data, location: details.location })
       } else if (details.type === "rpc.oc-yubikey.settled") {
         const data = details.data as { requestID: string }
         handleResolved(data.requestID)

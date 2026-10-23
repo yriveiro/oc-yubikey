@@ -25,7 +25,11 @@ import {
   type PromptInputByKind,
   type PromptOutputByKind,
 } from "./coordinator.ts"
-import { sanitizeDisplayText } from "./protocol.ts"
+import {
+  type LocationIdentity,
+  isMatchingLocation,
+  sanitizeDisplayText,
+} from "./protocol.ts"
 import {
   Pinentry,
   type RequestKind,
@@ -45,6 +49,7 @@ import {
 
 export {
   type AskpassClassification,
+  type LocationIdentity,
   PinentryBridge,
   type PinentryBridgeOptions,
   PinentryCoordinator,
@@ -66,6 +71,7 @@ export {
   formatFriendlySshKeyType,
   isAppleAgentSocket,
   isAppleLaunchdSshAgentSocket,
+  isMatchingLocation,
   parseSshAgentSignRequest,
   resolveGpgWrapperPath,
   resolvePinentryCliPath,
@@ -225,6 +231,7 @@ export default Plugin.define({
 
     const bridge = new PinentryBridge({
       coordinator,
+      directory: ctx.location?.directory,
       getCardStatus: () => getYubiKeyCardStatus(),
     })
     await bridge.start()

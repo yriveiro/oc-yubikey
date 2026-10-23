@@ -46,6 +46,37 @@ declare var process: {
   on(event: "SIGTERM" | "SIGINT" | "SIGHUP", listener: () => void): void
 }
 
+interface BunSpawnOptions {
+  readonly cmd?: readonly string[]
+  readonly cwd?: string | URL
+  readonly env?: Record<string, string | undefined>
+  readonly stdin?: "ignore" | "pipe" | "inherit" | null
+  readonly stdout?: "ignore" | "pipe" | "inherit" | null
+  readonly stderr?: "ignore" | "pipe" | "inherit" | null
+  readonly [key: string]: unknown
+}
+
+interface BunSubprocess {
+  readonly pid: number
+  readonly exited: Promise<number>
+  readonly stdout?: ReadableStream<Uint8Array> | null
+  readonly stderr?: ReadableStream<Uint8Array> | null
+  kill(signal?: number | string): void
+}
+
+interface BunSyncSubprocess {
+  readonly exitCode: number
+  readonly stdout?: Buffer
+  readonly stderr?: Buffer
+}
+
+declare var Bun: {
+  spawn(cmd: readonly string[], options?: BunSpawnOptions): BunSubprocess
+  spawn(options: BunSpawnOptions & { readonly cmd: readonly string[] }): BunSubprocess
+  spawnSync(cmd: readonly string[], options?: BunSpawnOptions): BunSyncSubprocess
+  spawnSync(options: BunSpawnOptions & { readonly cmd: readonly string[] }): BunSyncSubprocess
+}
+
 declare module "node:crypto" {
   export interface Hash {
     update(data: string | Uint8Array): this
@@ -295,6 +326,10 @@ declare module "@opencode/plugin" {
   }
 
   export interface ServerPluginContext {
+    readonly location?: {
+      readonly directory?: string
+      readonly workspaceID?: string
+    }
     readonly options?: Readonly<Record<string, unknown>>
     readonly rpc: {
       register<D extends RpcDefinition>(
@@ -397,6 +432,9 @@ declare module "@opencode/plugin/tui/context" {
       readonly location: {
         default(): LocationRef
       }
+      readonly session?: {
+        get(sessionID: string): { readonly location?: LocationRef } | undefined
+      }
       listen(
         handler: (event: {
           readonly details: {
@@ -447,6 +485,9 @@ declare module "@opencode/plugin/tui/context" {
       layer(factory: () => KeymapLayer): void
     }
     readonly ui: {
+      readonly router?: {
+        current(): { readonly type: string; readonly sessionID?: string }
+      }
       readonly dialog: {
         show(render: () => JSX.Element, onClose?: () => void): void
         set(options: { readonly size?: "medium" | "large" | "xlarge"; readonly centered?: boolean }): void

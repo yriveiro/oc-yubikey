@@ -288,3 +288,26 @@ export function resolveIpcTarget(
 
   return { socketPath: undefined, token: undefined, command: env.OC_YUBIKEY_COMMAND }
 }
+
+export interface LocationIdentity {
+  readonly directory?: string
+  readonly workspaceID?: string
+}
+
+export function isMatchingLocation(
+  eventLocation: LocationIdentity | undefined,
+  activeLocation: LocationIdentity | undefined,
+): boolean {
+  if (!eventLocation?.directory || !activeLocation?.directory) return false
+  if (path.resolve(eventLocation.directory) !== path.resolve(activeLocation.directory)) {
+    return false
+  }
+  if (
+    eventLocation.workspaceID !== undefined &&
+    activeLocation.workspaceID !== undefined &&
+    eventLocation.workspaceID !== activeLocation.workspaceID
+  ) {
+    return false
+  }
+  return true
+}

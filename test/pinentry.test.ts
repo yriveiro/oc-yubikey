@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test"
 import { spawn } from "node:child_process"
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
@@ -17,7 +17,7 @@ import {
   resolvePinentryCliPath,
 } from "../src/bridge.ts"
 import { PinentryCoordinator, type PromptOutputByKind } from "../src/coordinator.ts"
-import { resolveIpcTarget, sanitizeDisplayText } from "../src/protocol.ts"
+import { isMatchingLocation, resolveIpcTarget, sanitizeDisplayText } from "../src/protocol.ts"
 import type {
   PromptPinOutput,
   PromptTouchOutput,
@@ -1356,6 +1356,7 @@ if [ "$pin" != "246810" ]; then
   exit 2
 fi
 echo "[GNUPG:] GOT_IT" >&2
+sleep 0.08
 echo "[GNUPG:] SIG_CREATED D 22 10 00 1700000000 111122223333444455556666777788889999AAAA" >&2
 cat <<'EOF'
 -----BEGIN PGP SIGNATURE-----
@@ -1371,12 +1372,18 @@ EOF
     chmodSync(mockGpg, 0o755)
 
     const requested: RequestSummary[] = []
+    const resolved: ResolvedEvent[] = []
     const coordinator = new PinentryCoordinator({
       onRequested(summary) {
         requested.push(summary)
-        setTimeout(() => {
-          coordinator.submit(summary.requestID, "246810")
-        }, 15)
+        if (summary.kind === "pin") {
+          setTimeout(() => {
+            coordinator.submit(summary.requestID, "246810")
+          }, 15)
+        }
+      },
+      onResolved(event) {
+        resolved.push(event)
       },
     })
     const bridge = new PinentryBridge({ coordinator, socketDir: tmpDir })
@@ -1389,6 +1396,7 @@ EOF
         GIT_CONFIG_KEY_0: "user.signingkey",
         GIT_CONFIG_VALUE_0: "111122223333444455556666777788889999AAAA",
         OC_YUBIKEY_GPG_BIN: mockGpg,
+        OC_YUBIKEY_GPG_TOUCH_DELAY_MS: "20",
       }
       await bridge.prepareShellEnv(env, "git commit -S -m test")
       await bridge.prepareShellEnv(env, "git commit -S -m test")
@@ -1417,10 +1425,16 @@ EOF
 
       const commitRes = await runGit(["commit", "--allow-empty", "-S", "-m", "signed commit"])
       expect(commitRes.code).toBe(0)
-      expect(requested.length).toBe(1)
+      expect(requested.length).toBe(2)
       expect(requested[0]?.kind).toBe("pin")
       expect(requested[0]?.description).toContain("Jane Doe <jane@example.com>")
       expect(requested[0]?.command).toBe("git commit -S -m test")
+      expect(requested[1]?.kind).toBe("touch")
+      expect(requested[1]?.description).toContain("Jane Doe <jane@example.com>")
+      expect(resolved[1]).toEqual({
+        requestID: requested[1]!.requestID,
+        outcome: "confirmed",
+      })
 
       const catRes = await runGit(["cat-file", "-p", "HEAD"])
       expect(catRes.stdout).toContain("-----BEGIN PGP SIGNATURE-----")
@@ -1502,6 +1516,139 @@ EOF
       otherCoordinator.close()
       await ownerBridge.close()
       await otherBridge.close()
+      for (const [k, v] of Object.entries(savedEnv)) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+      }
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  it("propagates SSH_ASKPASS to Bun.spawn calls that omit env and scopes prompts to the requesting worktree location", async () => {
+    const baseTmp = existsSync("/tmp") ? "/tmp" : os.tmpdir()
+    const tmpDir = mkdtempSync(path.join(baseTmp, "oc-bun-spawn-"))
+    const worktreeA = path.join(tmpDir, "wt-a")
+    const worktreeB = path.join(tmpDir, "wt-b")
+    const upstreamSock = path.join(tmpDir, "upstream-ssh.sock")
+    mkdirSync(worktreeA, { recursive: true })
+    mkdirSync(worktreeB, { recursive: true })
+
+    expect(isMatchingLocation({ directory: worktreeA }, { directory: worktreeA })).toBe(true)
+    expect(isMatchingLocation({ directory: worktreeA }, { directory: worktreeB })).toBe(false)
+    expect(isMatchingLocation(undefined, { directory: worktreeA })).toBe(false)
+    expect(
+      isMatchingLocation(
+        { directory: worktreeA, workspaceID: "ws-1" },
+        { directory: worktreeA, workspaceID: "ws-2" },
+      ),
+    ).toBe(false)
+
+    const upstreamServer = net.createServer(() => {})
+    await new Promise<void>((resolve) => upstreamServer.listen(upstreamSock, () => resolve()))
+    chmodSync(upstreamSock, 0o600)
+
+    const savedEnv = {
+      OC_YUBIKEY_SOCK: process.env.OC_YUBIKEY_SOCK,
+      OC_YUBIKEY_TOKEN: process.env.OC_YUBIKEY_TOKEN,
+      OC_YUBIKEY_COMMAND: process.env.OC_YUBIKEY_COMMAND,
+      PINENTRY_USER_DATA: process.env.PINENTRY_USER_DATA,
+      SSH_ASKPASS: process.env.SSH_ASKPASS,
+      SSH_ASKPASS_REQUIRE: process.env.SSH_ASKPASS_REQUIRE,
+      DISPLAY: process.env.DISPLAY,
+      GPG_TTY: process.env.GPG_TTY,
+      SSH_AUTH_SOCK: process.env.SSH_AUTH_SOCK,
+      GIT_CONFIG_COUNT: process.env.GIT_CONFIG_COUNT,
+      GIT_CONFIG_KEY_0: process.env.GIT_CONFIG_KEY_0,
+      GIT_CONFIG_VALUE_0: process.env.GIT_CONFIG_VALUE_0,
+    }
+
+    delete process.env.OC_YUBIKEY_SOCK
+    delete process.env.OC_YUBIKEY_TOKEN
+    delete process.env.OC_YUBIKEY_COMMAND
+    delete process.env.PINENTRY_USER_DATA
+    delete process.env.SSH_ASKPASS
+    delete process.env.SSH_ASKPASS_REQUIRE
+    delete process.env.DISPLAY
+    process.env.GPG_TTY = "/dev/ttys009"
+    process.env.SSH_AUTH_SOCK = upstreamSock
+    delete process.env.GIT_CONFIG_COUNT
+    delete process.env.GIT_CONFIG_KEY_0
+    delete process.env.GIT_CONFIG_VALUE_0
+
+    const requestedA: RequestSummary[] = []
+    const requestedB: RequestSummary[] = []
+    const coordinatorA = new PinentryCoordinator({
+      onRequested(summary) {
+        requestedA.push(summary)
+        setTimeout(() => coordinatorA.confirmTouch(summary.requestID), 15)
+      },
+    })
+    const coordinatorB = new PinentryCoordinator({
+      onRequested(summary) {
+        requestedB.push(summary)
+        setTimeout(() => coordinatorB.confirmTouch(summary.requestID), 15)
+      },
+    })
+
+    const bridgeA = new PinentryBridge({
+      coordinator: coordinatorA,
+      socketDir: tmpDir,
+      directory: worktreeA,
+    })
+    await bridgeA.start()
+    await bridgeA.prepareShellEnv(process.env)
+
+    const bridgeB = new PinentryBridge({
+      coordinator: coordinatorB,
+      socketDir: tmpDir,
+      directory: worktreeB,
+    })
+    await bridgeB.start()
+    await bridgeB.prepareShellEnv(process.env)
+
+    try {
+      const proc = Bun.spawn(
+        [
+          "sh",
+          "-c",
+          'exec "$SSH_ASKPASS" "Confirm user presence for key ED25519-SK SHA256:bunSpawnPush"',
+        ],
+        { cwd: worktreeA, stdout: "pipe", stderr: "pipe" },
+      )
+      const exitCode = await proc.exited
+
+      expect(exitCode).toBe(0)
+      expect(requestedA.length).toBe(1)
+      expect(requestedA[0]?.kind).toBe("touch")
+      expect(requestedA[0]?.keyType).toBe("ED25519-SK")
+      expect(requestedA[0]?.fingerprint).toBe("SHA256:bunSpawnPush")
+      expect(requestedB.length).toBe(0)
+
+      const syncRes = Bun.spawnSync(
+        ["sh", "-c", 'printf "%s|%s" "$OC_YUBIKEY_SOCK" "$SSH_AUTH_SOCK"'],
+        { cwd: worktreeA },
+      )
+      const [syncIpcSock, syncSshSock] = (syncRes.stdout?.toString("utf8") ?? "").split("|")
+      expect(syncIpcSock).toBe(bridgeA.socketPath)
+      expect(syncSshSock).toContain("ssh-")
+      expect(syncSshSock).not.toBe(upstreamSock)
+
+      await bridgeA.close()
+      expect(process.env.OC_YUBIKEY_SOCK).toBe(bridgeB.socketPath)
+      expect(process.env.SSH_AUTH_SOCK).toContain("ssh-")
+      expect(process.env.SSH_AUTH_SOCK).not.toBe(upstreamSock)
+
+      await bridgeB.close()
+      expect(process.env.OC_YUBIKEY_SOCK).toBeUndefined()
+      expect(process.env.SSH_ASKPASS).toBeUndefined()
+      expect(process.env.GPG_TTY).toBe("/dev/ttys009")
+      expect(process.env.SSH_AUTH_SOCK).toBe(upstreamSock)
+    } finally {
+      coordinatorA.close()
+      coordinatorB.close()
+      await bridgeA.close()
+      await bridgeB.close()
+      await new Promise<void>((resolve) => upstreamServer.close(() => resolve()))
       for (const [k, v] of Object.entries(savedEnv)) {
         if (v === undefined) delete process.env[k]
         else process.env[k] = v

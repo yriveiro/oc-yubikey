@@ -178,6 +178,7 @@ export function resolveGpgWrapperPath(): string {
 }
 
 const PROCESS_ENV_SNAPSHOT_KEYS = [
+  "PATH",
   "OC_YUBIKEY_SOCK",
   "OC_YUBIKEY_TOKEN",
   "OC_YUBIKEY_COMMAND",
@@ -189,6 +190,33 @@ const PROCESS_ENV_SNAPSHOT_KEYS = [
   "SSH_AUTH_SOCK",
   "GIT_CONFIG_COUNT",
 ] as const
+
+const PREFERRED_MAC_BIN_DIRS = [
+  "/opt/homebrew/bin",
+  "/usr/local/MacGPG2/bin",
+  "/usr/local/bin",
+] as const
+
+function ensurePreferredBinDirsOnPath(currentPath: string | undefined): string {
+  const existing = PREFERRED_MAC_BIN_DIRS.filter((dir) => existsSync(dir))
+  if (existing.length === 0) return currentPath ?? ""
+  const parts = (currentPath ?? "").split(":").filter(Boolean)
+  const usrBinIdx = parts.indexOf("/usr/bin")
+  const allPreceding = existing.every((dir) => {
+    const idx = parts.indexOf(dir)
+    return idx !== -1 && (usrBinIdx === -1 || idx < usrBinIdx)
+  })
+  if (allPreceding) return currentPath ?? existing.join(":")
+  const remaining = parts.filter(
+    (dir) => !existing.includes(dir as (typeof PREFERRED_MAC_BIN_DIRS)[number]),
+  )
+  return [...existing, ...remaining].join(":")
+}
+
+const ACTIVE_BRIDGES = new Set<PinentryBridge>()
+let initialProcessEnvSnapshot: Map<string, string | undefined> | undefined
+let originalBunSpawn: ((...args: unknown[]) => unknown) | undefined
+let originalBunSpawnSync: ((...args: unknown[]) => unknown) | undefined
 
 function isOcSshProxySocketPath(socketPath: string | undefined, socketDir: string): boolean {
   return (
@@ -209,23 +237,131 @@ function captureEnvKeys(
   }
 }
 
-function restoreEnvKeys(
-  snapshot: Map<string, string | undefined> | undefined,
-  ownedSocketPath: string,
-): void {
-  if (!snapshot) return
-  if (
-    process.env.OC_YUBIKEY_SOCK !== undefined &&
-    process.env.OC_YUBIKEY_SOCK !== ownedSocketPath
-  ) {
-    return
+function normalizeCwdPath(cwd: unknown): string | undefined {
+  if (typeof cwd === "string" && cwd.length > 0) {
+    return path.resolve(cwd)
   }
-  for (const [key, originalValue] of snapshot) {
-    if (originalValue === undefined) {
-      delete process.env[key]
-    } else {
-      process.env[key] = originalValue
+  if (cwd instanceof URL) {
+    try {
+      return path.resolve(fileURLToPath(cwd))
+    } catch {
+      return undefined
     }
+  }
+  return undefined
+}
+
+function isDirectoryMatch(bridgeDir: string, targetCwd: string): boolean {
+  const rel = path.relative(path.resolve(bridgeDir), path.resolve(targetCwd))
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel))
+}
+
+function findBestDirectoryBridge(
+  active: readonly PinentryBridge[],
+  cwdPath: string,
+): PinentryBridge | undefined {
+  let bestMatch: PinentryBridge | undefined
+  let bestLen = -1
+  for (const bridge of active) {
+    if (!bridge.directory) continue
+    const resolvedDir = path.resolve(bridge.directory)
+    if (isDirectoryMatch(resolvedDir, cwdPath) && resolvedDir.length >= bestLen) {
+      bestMatch = bridge
+      bestLen = resolvedDir.length
+    }
+  }
+  return bestMatch
+}
+
+function selectBridgeForSpawn(cwd: unknown): PinentryBridge | undefined {
+  const active = [...ACTIVE_BRIDGES]
+  if (active.length === 0) return undefined
+
+  const cwdPath = normalizeCwdPath(cwd)
+  const byDir = cwdPath ? findBestDirectoryBridge(active, cwdPath) : undefined
+  if (byDir) return byDir
+
+  const currentSock = process.env.OC_YUBIKEY_SOCK
+  return (
+    (currentSock ? active.find((bridge) => bridge.socketPath === currentSock) : undefined) ??
+    active[active.length - 1]
+  )
+}
+
+function deriveCommandFromSpawnArgv(cmd: unknown): string | undefined {
+  if (!Array.isArray(cmd) || cmd.length === 0) return undefined
+  const first = typeof cmd[0] === "string" ? path.basename(cmd[0]) : ""
+  if (first === "oc-yubikey" || first === "oc-yubikey-gpg") return undefined
+  const parts = cmd.filter((part): part is string => typeof part === "string")
+  return parts.length > 0 ? parts.join(" ") : undefined
+}
+
+function buildInjectedSpawnEnv(
+  cwd: unknown,
+  cmd: unknown,
+): Record<string, string | undefined> | undefined {
+  const bridge = selectBridgeForSpawn(cwd)
+  if (!bridge) return undefined
+  const env: Record<string, string | undefined> = { ...process.env }
+  bridge.applyEnvSync(env, deriveCommandFromSpawnArgv(cmd))
+  return env
+}
+
+function withInjectedBunSpawnArgs(args: unknown[]): unknown[] {
+  if (ACTIVE_BRIDGES.size === 0) return args
+  const first = args[0]
+
+  if (Array.isArray(first)) {
+    const rawOpts =
+      typeof args[1] === "object" && args[1] !== null
+        ? (args[1] as Record<string, unknown>)
+        : undefined
+    if (rawOpts?.env !== undefined) return args
+    const env = buildInjectedSpawnEnv(rawOpts?.cwd, first)
+    return env ? [first, { ...(rawOpts ?? {}), env }, ...args.slice(2)] : args
+  }
+
+  if (typeof first === "object" && first !== null) {
+    const rawOpts = first as Record<string, unknown>
+    if (rawOpts.env !== undefined) return args
+    const env = buildInjectedSpawnEnv(rawOpts.cwd, rawOpts.cmd)
+    return env ? [{ ...rawOpts, env }, ...args.slice(1)] : args
+  }
+
+  return args
+}
+
+function installBunSpawnInterceptor(): void {
+  if (typeof Bun === "undefined" || !Bun) return
+  const bunObj = Bun as unknown as {
+    spawn?: (...args: unknown[]) => unknown
+    spawnSync?: (...args: unknown[]) => unknown
+  }
+  if (!originalBunSpawn && typeof bunObj.spawn === "function") {
+    const realSpawn = bunObj.spawn.bind(Bun)
+    originalBunSpawn = realSpawn
+    bunObj.spawn = (...args: unknown[]) => realSpawn(...withInjectedBunSpawnArgs(args))
+  }
+  if (!originalBunSpawnSync && typeof bunObj.spawnSync === "function") {
+    const realSpawnSync = bunObj.spawnSync.bind(Bun)
+    originalBunSpawnSync = realSpawnSync
+    bunObj.spawnSync = (...args: unknown[]) => realSpawnSync(...withInjectedBunSpawnArgs(args))
+  }
+}
+
+function uninstallBunSpawnInterceptor(): void {
+  if (typeof Bun === "undefined" || !Bun) return
+  const bunObj = Bun as unknown as {
+    spawn?: (...args: unknown[]) => unknown
+    spawnSync?: (...args: unknown[]) => unknown
+  }
+  if (originalBunSpawn) {
+    bunObj.spawn = originalBunSpawn
+    originalBunSpawn = undefined
+  }
+  if (originalBunSpawnSync) {
+    bunObj.spawnSync = originalBunSpawnSync
+    originalBunSpawnSync = undefined
   }
 }
 
@@ -240,7 +376,65 @@ function resolveUpstreamSshAuthSock(
   if (process.env.SSH_AUTH_SOCK && !isOcSshProxySocketPath(process.env.SSH_AUTH_SOCK, socketDir)) {
     return process.env.SSH_AUTH_SOCK
   }
-  return fallbackSock
+  if (fallbackSock && !isOcSshProxySocketPath(fallbackSock, socketDir)) {
+    return fallbackSock
+  }
+  const initialSock = initialProcessEnvSnapshot?.get("SSH_AUTH_SOCK")
+  if (initialSock && !isOcSshProxySocketPath(initialSock, socketDir)) {
+    return initialSock
+  }
+  return undefined
+}
+
+function populateShellEnvRecord(
+  env: Record<string, string | undefined>,
+  options: {
+    readonly ipcSocketPath: string
+    readonly authToken: string
+    readonly effectiveCmd: string | undefined
+    readonly proxySocketPath: string | undefined
+    readonly onBeforeMutateKeys: (keys: readonly string[]) => void
+  },
+): void {
+  const updatedPath = ensurePreferredBinDirsOnPath(env.PATH ?? process.env.PATH)
+  if (updatedPath) {
+    env.PATH = updatedPath
+  }
+  env.OC_YUBIKEY_SOCK = options.ipcSocketPath
+  env.OC_YUBIKEY_TOKEN = options.authToken
+  if (options.effectiveCmd) {
+    env.OC_YUBIKEY_COMMAND = options.effectiveCmd
+  } else {
+    delete env.OC_YUBIKEY_COMMAND
+  }
+
+  env.GPG_TTY = "/dev/null"
+
+  const cliPath = resolvePinentryCliPath()
+  if (existsSync(cliPath)) {
+    env.SSH_ASKPASS = cliPath
+    if (!env.SSH_ASKPASS_REQUIRE) {
+      env.SSH_ASKPASS_REQUIRE = "force"
+    }
+    if (!env.DISPLAY) {
+      env.DISPLAY = "oc-yubikey:0"
+    }
+  }
+
+  const gpgWrapperPath = resolveGpgWrapperPath()
+  if (existsSync(gpgWrapperPath)) {
+    injectGitGpgProgramConfig(env, gpgWrapperPath, options.onBeforeMutateKeys)
+  }
+
+  env.PINENTRY_USER_DATA = JSON.stringify({
+    sock: options.ipcSocketPath,
+    token: options.authToken,
+    cmd: options.effectiveCmd,
+  })
+
+  if (options.proxySocketPath) {
+    env.SSH_AUTH_SOCK = options.proxySocketPath
+  }
 }
 
 function injectGitGpgProgramConfig(
@@ -325,6 +519,7 @@ export interface IpcResponseMessage {
 export interface PinentryBridgeOptions {
   readonly coordinator: PinentryCoordinator
   readonly socketDir?: string
+  readonly directory?: string
   readonly securityKeyDebounceMs?: number
   readonly hardwareAgentDebounceMs?: number
   readonly getCardStatus?: () => Promise<YubiKeyCardStatus>
@@ -411,6 +606,7 @@ function spawnSshKeygenSign(skKeyPath: string) {
 export class PinentryBridge {
   private readonly coordinator: PinentryCoordinator
   private readonly socketDir: string
+  readonly directory?: string
   private readonly id: string
   private readonly authToken: string
   private readonly ipcSocketPath: string
@@ -434,6 +630,7 @@ export class PinentryBridge {
   constructor(options: PinentryBridgeOptions) {
     this.coordinator = options.coordinator
     this.socketDir = options.socketDir ?? getRuntimeSocketDir()
+    this.directory = options.directory
     mkdirSync(this.socketDir, { recursive: true, mode: 0o700 })
     verifySecureSocketDir(this.socketDir)
     this.id = randomBytes(4).toString("hex")
@@ -443,11 +640,16 @@ export class PinentryBridge {
     this.securityKeyDebounceMs = options.securityKeyDebounceMs ?? 40
     this.hardwareAgentDebounceMs = options.hardwareAgentDebounceMs ?? 150
     this.getCardStatus = options.getCardStatus
-    if (
+    const candidateUpstreamSock =
       process.env.SSH_AUTH_SOCK &&
       !isOcSshProxySocketPath(process.env.SSH_AUTH_SOCK, this.socketDir)
+        ? process.env.SSH_AUTH_SOCK
+        : initialProcessEnvSnapshot?.get("SSH_AUTH_SOCK")
+    if (
+      candidateUpstreamSock &&
+      !isOcSshProxySocketPath(candidateUpstreamSock, this.socketDir)
     ) {
-      this.initialUpstreamSshSock = process.env.SSH_AUTH_SOCK
+      this.initialUpstreamSshSock = candidateUpstreamSock
     }
   }
 
@@ -835,14 +1037,63 @@ export class PinentryBridge {
     extraKeys: readonly string[] = [],
   ): void {
     if (env !== process.env) return
+    const keys = [...PROCESS_ENV_SNAPSHOT_KEYS, ...extraKeys]
     this.savedProcessEnv ??= new Map<string, string | undefined>()
-    captureEnvKeys(this.savedProcessEnv, [...PROCESS_ENV_SNAPSHOT_KEYS, ...extraKeys])
+    captureEnvKeys(this.savedProcessEnv, keys)
+    initialProcessEnvSnapshot ??= new Map<string, string | undefined>()
+    captureEnvKeys(initialProcessEnvSnapshot, keys)
   }
 
   restoreProcessEnv(): void {
-    const snapshot = this.savedProcessEnv
+    const wasActive = ACTIVE_BRIDGES.delete(this)
+    if (!wasActive && !this.savedProcessEnv) return
     this.savedProcessEnv = undefined
-    restoreEnvKeys(snapshot, this.ipcSocketPath)
+
+    const remaining = [...ACTIVE_BRIDGES]
+    const fallbackBridge = remaining[remaining.length - 1]
+    if (fallbackBridge) {
+      fallbackBridge.applyEnvSync(process.env)
+      return
+    }
+
+    uninstallBunSpawnInterceptor()
+    if (!initialProcessEnvSnapshot) return
+    const snapshot = initialProcessEnvSnapshot
+    initialProcessEnvSnapshot = undefined
+    for (const [key, originalValue] of snapshot) {
+      if (originalValue === undefined) {
+        delete process.env[key]
+      } else {
+        process.env[key] = originalValue
+      }
+    }
+  }
+
+  applyEnvSync(env: Record<string, string | undefined>, command?: string): void {
+    if (this.closed) return
+    this.snapshotProcessEnv(env)
+
+    const summarizedCmd = summarizeCommand(command)
+    if (command !== undefined || env === process.env) {
+      this.latestCommand = summarizedCmd
+    }
+    const effectiveCmd = summarizedCmd ?? this.latestCommand
+    const upstreamSshSock = resolveUpstreamSshAuthSock(
+      env,
+      this.socketDir,
+      this.initialUpstreamSshSock,
+    )
+    const proxySocketPath = upstreamSshSock
+      ? this.sshProxies.get(upstreamSshSock)?.proxySocketPath
+      : undefined
+
+    populateShellEnvRecord(env, {
+      ipcSocketPath: this.ipcSocketPath,
+      authToken: this.authToken,
+      effectiveCmd,
+      proxySocketPath,
+      onBeforeMutateKeys: (keys) => this.snapshotProcessEnv(env, keys),
+    })
   }
 
   async prepareShellEnv(
@@ -852,44 +1103,11 @@ export class PinentryBridge {
     if (this.closed) return
     await this.start()
 
-    this.snapshotProcessEnv(env)
-
-    const summarizedCmd = summarizeCommand(command)
-    this.latestCommand = summarizedCmd
-
-    env.OC_YUBIKEY_SOCK = this.ipcSocketPath
-    env.OC_YUBIKEY_TOKEN = this.authToken
-    if (summarizedCmd) {
-      env.OC_YUBIKEY_COMMAND = summarizedCmd
-    } else {
-      delete env.OC_YUBIKEY_COMMAND
+    if (env === process.env) {
+      ACTIVE_BRIDGES.delete(this)
+      ACTIVE_BRIDGES.add(this)
+      installBunSpawnInterceptor()
     }
-
-    env.GPG_TTY = "/dev/null"
-
-    const cliPath = resolvePinentryCliPath()
-    if (existsSync(cliPath)) {
-      env.SSH_ASKPASS = cliPath
-      if (!env.SSH_ASKPASS_REQUIRE) {
-        env.SSH_ASKPASS_REQUIRE = "force"
-      }
-      if (!env.DISPLAY) {
-        env.DISPLAY = "oc-yubikey:0"
-      }
-    }
-
-    const gpgWrapperPath = resolveGpgWrapperPath()
-    if (existsSync(gpgWrapperPath)) {
-      injectGitGpgProgramConfig(env, gpgWrapperPath, (keys) =>
-        this.snapshotProcessEnv(env, keys),
-      )
-    }
-
-    env.PINENTRY_USER_DATA = JSON.stringify({
-      sock: this.ipcSocketPath,
-      token: this.authToken,
-      cmd: summarizedCmd,
-    })
 
     const upstreamSshSock = resolveUpstreamSshAuthSock(
       env,
@@ -906,11 +1124,12 @@ export class PinentryBridge {
           stat.isSocket() &&
           (typeof process.getuid !== "function" || stat.uid === uid)
         ) {
-          const proxySock = await this.ensureSshAgentProxy(upstreamSshSock, command)
-          env.SSH_AUTH_SOCK = proxySock
+          await this.ensureSshAgentProxy(upstreamSshSock, command)
         }
       } catch {}
     }
+
+    this.applyEnvSync(env, command)
   }
 
   /**
