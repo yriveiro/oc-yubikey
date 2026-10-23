@@ -16,6 +16,7 @@ import {
   isAppleAgentSocket,
   isAppleLaunchdSshAgentSocket,
   parseSshAgentSignRequest,
+  resolveGpgWrapperPath,
   resolvePinentryCliPath,
 } from "./bridge.ts"
 import {
@@ -66,6 +67,7 @@ export {
   isAppleAgentSocket,
   isAppleLaunchdSshAgentSocket,
   parseSshAgentSignRequest,
+  resolveGpgWrapperPath,
   resolvePinentryCliPath,
   sanitizeDisplayText,
 }
@@ -135,7 +137,7 @@ function registerInteractiveYubiKeyTools(
     name: "yubikey_unlock",
     options: { codemode: false },
     description:
-      "Prompt the user in the OpenCode TUI modal for their YubiKey OpenPGP PIN and verify/cache it directly in gpg-agent via Assuan loopback (SCD CHECKPIN). Use this before running signed git commits or tags. The PIN is never exposed to the model.",
+      "Prompt the user in the OpenCode TUI modal for their YubiKey OpenPGP PIN and verify/cache it directly in gpg-agent via Assuan loopback (PKSIGN / SCD CHECKPIN). Use this before running signed git commits or tags. The PIN is never exposed to the model.",
     input: UNLOCK_INPUT_SCHEMA,
     execute: async (rawInput, context) => {
       const input = (rawInput ?? {}) as { reason?: string }
@@ -226,6 +228,7 @@ export default Plugin.define({
       getCardStatus: () => getYubiKeyCardStatus(),
     })
     await bridge.start()
+    await bridge.prepareShellEnv(process.env)
 
     const rpcRegistration = await ctx.rpc.register(
       Pinentry,
@@ -244,6 +247,7 @@ export default Plugin.define({
     })
 
     return async () => {
+      bridge.restoreProcessEnv()
       coordinator.close()
       await bridge.close()
       await shellHookRegistration.dispose()

@@ -168,9 +168,106 @@ export function getRuntimeSocketDir(): string {
   return dir
 }
 
-export function resolvePinentryCliPath(): string {
+export function resolvePinentryCliPath(binName = "oc-yubikey"): string {
   const currentDir = path.dirname(fileURLToPath(import.meta.url))
-  return path.resolve(currentDir, "..", "bin", "oc-yubikey")
+  return path.resolve(currentDir, "..", "bin", binName)
+}
+
+export function resolveGpgWrapperPath(): string {
+  return resolvePinentryCliPath("oc-yubikey-gpg")
+}
+
+const PROCESS_ENV_SNAPSHOT_KEYS = [
+  "OC_YUBIKEY_SOCK",
+  "OC_YUBIKEY_TOKEN",
+  "OC_YUBIKEY_COMMAND",
+  "GPG_TTY",
+  "SSH_ASKPASS",
+  "SSH_ASKPASS_REQUIRE",
+  "DISPLAY",
+  "PINENTRY_USER_DATA",
+  "SSH_AUTH_SOCK",
+  "GIT_CONFIG_COUNT",
+] as const
+
+function isOcSshProxySocketPath(socketPath: string | undefined, socketDir: string): boolean {
+  return (
+    socketPath !== undefined &&
+    path.resolve(path.dirname(socketPath)) === path.resolve(socketDir) &&
+    path.basename(socketPath).startsWith("ssh-")
+  )
+}
+
+function captureEnvKeys(
+  snapshot: Map<string, string | undefined>,
+  keys: readonly string[],
+): void {
+  for (const key of keys) {
+    if (!snapshot.has(key)) {
+      snapshot.set(key, process.env[key])
+    }
+  }
+}
+
+function restoreEnvKeys(
+  snapshot: Map<string, string | undefined> | undefined,
+  ownedSocketPath: string,
+): void {
+  if (!snapshot) return
+  if (
+    process.env.OC_YUBIKEY_SOCK !== undefined &&
+    process.env.OC_YUBIKEY_SOCK !== ownedSocketPath
+  ) {
+    return
+  }
+  for (const [key, originalValue] of snapshot) {
+    if (originalValue === undefined) {
+      delete process.env[key]
+    } else {
+      process.env[key] = originalValue
+    }
+  }
+}
+
+function resolveUpstreamSshAuthSock(
+  env: Record<string, string | undefined>,
+  socketDir: string,
+  fallbackSock: string | undefined,
+): string | undefined {
+  if (env.SSH_AUTH_SOCK && !isOcSshProxySocketPath(env.SSH_AUTH_SOCK, socketDir)) {
+    return env.SSH_AUTH_SOCK
+  }
+  if (process.env.SSH_AUTH_SOCK && !isOcSshProxySocketPath(process.env.SSH_AUTH_SOCK, socketDir)) {
+    return process.env.SSH_AUTH_SOCK
+  }
+  return fallbackSock
+}
+
+function injectGitGpgProgramConfig(
+  env: Record<string, string | undefined>,
+  gpgWrapperPath: string,
+  onBeforeMutateKeys?: (keys: readonly string[]) => void,
+): void {
+  const rawCount = env.GIT_CONFIG_COUNT
+  const parsedCount = rawCount !== undefined ? Number.parseInt(rawCount, 10) : 0
+  const count = Number.isInteger(parsedCount) && parsedCount >= 0 ? parsedCount : 0
+
+  for (let i = 0; i < count; i++) {
+    if (env[`GIT_CONFIG_KEY_${i}`] === "gpg.program") {
+      onBeforeMutateKeys?.([`GIT_CONFIG_KEY_${i}`, `GIT_CONFIG_VALUE_${i}`])
+      env[`GIT_CONFIG_VALUE_${i}`] = gpgWrapperPath
+      return
+    }
+  }
+
+  onBeforeMutateKeys?.([
+    "GIT_CONFIG_COUNT",
+    `GIT_CONFIG_KEY_${count}`,
+    `GIT_CONFIG_VALUE_${count}`,
+  ])
+  env.GIT_CONFIG_COUNT = String(count + 1)
+  env[`GIT_CONFIG_KEY_${count}`] = "gpg.program"
+  env[`GIT_CONFIG_VALUE_${count}`] = gpgWrapperPath
 }
 
 export function findSshSecurityKeyFile(
@@ -296,7 +393,12 @@ function buildHardwareTouchRequest(
 
 function spawnSshKeygenSign(skKeyPath: string) {
   const sshKeygenBin = resolveTrustedExecutable("ssh-keygen")
-  const env: Record<string, string | undefined> = { ...process.env, SSH_AUTH_SOCK: undefined }
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    SSH_AUTH_SOCK: undefined,
+    SSH_ASKPASS: undefined,
+    SSH_ASKPASS_REQUIRE: undefined,
+  }
   const child = spawn(sshKeygenBin, ["-Y", "sign", "-f", skKeyPath, "-n", "oc-yubikey-touch"], {
     env,
     stdio: ["pipe", "pipe", "pipe"],
@@ -306,13 +408,6 @@ function spawnSshKeygenSign(skKeyPath: string) {
   return child
 }
 
-/**
- * Manages:
- * 1. An authenticated local IPC Unix socket server for `bin/oc-yubikey` (`SSH_ASKPASS` + GnuPG Assuan `pinentry` shim)
- * 2. An `SSH_AUTH_SOCK` transparent proxy that detects `SSH2_AGENTC_SIGN_REQUEST` waiting on YubiKey touch
- *    (such as `sk-ssh-ed25519@openssh.com` in `ssh-agent` or `gpg-agent`'s SSH socket) and opens
- *    the OpenCode TUI Touch Modal automatically, closing it the instant the user touches the YubiKey.
- */
 export class PinentryBridge {
   private readonly coordinator: PinentryCoordinator
   private readonly socketDir: string
@@ -331,6 +426,8 @@ export class PinentryBridge {
       readonly server: net.Server
     }
   >()
+  private savedProcessEnv?: Map<string, string | undefined>
+  private initialUpstreamSshSock?: string
   private latestCommand?: string
   private closed = false
 
@@ -346,6 +443,12 @@ export class PinentryBridge {
     this.securityKeyDebounceMs = options.securityKeyDebounceMs ?? 40
     this.hardwareAgentDebounceMs = options.hardwareAgentDebounceMs ?? 150
     this.getCardStatus = options.getCardStatus
+    if (
+      process.env.SSH_AUTH_SOCK &&
+      !isOcSshProxySocketPath(process.env.SSH_AUTH_SOCK, this.socketDir)
+    ) {
+      this.initialUpstreamSshSock = process.env.SSH_AUTH_SOCK
+    }
   }
 
   get socketPath(): string {
@@ -727,17 +830,29 @@ export class PinentryBridge {
     upstreamSocket.on("error", cleanup)
   }
 
-  /**
-   * Injects `SSH_AUTH_SOCK`, `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE`, `OC_YUBIKEY_SOCK`,
-   * `OC_YUBIKEY_TOKEN`, `PINENTRY_USER_DATA`, and `GPG_TTY=/dev/null` into a shell
-   * command environment before execution.
-   */
+  private snapshotProcessEnv(
+    env: Record<string, string | undefined>,
+    extraKeys: readonly string[] = [],
+  ): void {
+    if (env !== process.env) return
+    this.savedProcessEnv ??= new Map<string, string | undefined>()
+    captureEnvKeys(this.savedProcessEnv, [...PROCESS_ENV_SNAPSHOT_KEYS, ...extraKeys])
+  }
+
+  restoreProcessEnv(): void {
+    const snapshot = this.savedProcessEnv
+    this.savedProcessEnv = undefined
+    restoreEnvKeys(snapshot, this.ipcSocketPath)
+  }
+
   async prepareShellEnv(
     env: Record<string, string | undefined>,
     command?: string,
   ): Promise<void> {
     if (this.closed) return
     await this.start()
+
+    this.snapshotProcessEnv(env)
 
     const summarizedCmd = summarizeCommand(command)
     this.latestCommand = summarizedCmd
@@ -763,19 +878,26 @@ export class PinentryBridge {
       }
     }
 
+    const gpgWrapperPath = resolveGpgWrapperPath()
+    if (existsSync(gpgWrapperPath)) {
+      injectGitGpgProgramConfig(env, gpgWrapperPath, (keys) =>
+        this.snapshotProcessEnv(env, keys),
+      )
+    }
+
     env.PINENTRY_USER_DATA = JSON.stringify({
       sock: this.ipcSocketPath,
       token: this.authToken,
       cmd: summarizedCmd,
     })
 
-    const upstreamSshSock = env.SSH_AUTH_SOCK || process.env.SSH_AUTH_SOCK
-    const isAnyOcSshProxy =
-      upstreamSshSock !== undefined &&
-      path.resolve(path.dirname(upstreamSshSock)) === path.resolve(this.socketDir) &&
-      path.basename(upstreamSshSock).startsWith("ssh-")
-
-    if (upstreamSshSock && !isAnyOcSshProxy) {
+    const upstreamSshSock = resolveUpstreamSshAuthSock(
+      env,
+      this.socketDir,
+      this.initialUpstreamSshSock,
+    )
+    if (upstreamSshSock) {
+      this.initialUpstreamSshSock ??= upstreamSshSock
       try {
         const uid = typeof process.getuid === "function" ? process.getuid() : 0
         const stat = lstatSync(upstreamSshSock)
@@ -787,9 +909,7 @@ export class PinentryBridge {
           const proxySock = await this.ensureSshAgentProxy(upstreamSshSock, command)
           env.SSH_AUTH_SOCK = proxySock
         }
-      } catch {
-        // Keep original SSH_AUTH_SOCK if validation or proxy creation fails
-      }
+      } catch {}
     }
   }
 
@@ -862,6 +982,7 @@ export class PinentryBridge {
 
   async close(): Promise<void> {
     this.closed = true
+    this.restoreProcessEnv()
     const closes: Promise<void>[] = []
 
     if (this.ipcServer) {
