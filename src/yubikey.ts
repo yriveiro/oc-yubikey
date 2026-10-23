@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process"
-import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs"
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs"
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
@@ -7,6 +7,8 @@ import {
   assuanPercentDecode,
   assuanPercentEncode,
   encodeAssuanData,
+  getRuntimeSocketDirPath,
+  isSecureOwnedPath,
   parseAssuanData,
   parseOptionalInt,
 } from "./protocol.ts"
@@ -665,10 +667,65 @@ export async function presetPassphraseInAgent(
   }
 }
 
+export async function isGpgPinCacheWarm(
+  options: {
+    socketPath?: string
+    aid?: string
+    signal?: AbortSignal
+  } = {},
+): Promise<boolean> {
+  try {
+    const socketPath = await resolveGpgAgentSocketPath({
+      socketPath: options.socketPath,
+      signal: options.signal,
+    })
+    if (!existsSync(socketPath)) return false
+    const client = await GpgAgentAssuanClient.connect(socketPath, {
+      signal: options.signal,
+      timeoutMs: 3_000,
+    })
+    try {
+      const loopbackRes = await client.command("OPTION pinentry-mode=loopback")
+      if (!loopbackRes.ok) return false
+      const keyinfoRes = await client.command("KEYINFO --list")
+      if (!keyinfoRes.ok) return false
+      const sigKeygrip = findOpenPgpSignatureKeygrip(keyinfoRes.statusLines, options.aid)
+      if (!sigKeygrip) return false
+      const sigKeyRes = await client.command(`SIGKEY ${sigKeygrip}`)
+      if (!sigKeyRes.ok) return false
+      const setHashRes = await client.command(`SETHASH 10 ${ZERO_SHA512_HEX}`)
+      if (!setHashRes.ok) return false
+      let inquired = false
+      const signRes = await client.command("PKSIGN", {
+        onInquire: () => {
+          inquired = true
+          return undefined
+        },
+      })
+      return signRes.ok && !inquired
+    } finally {
+      await client.close()
+    }
+  } catch {
+    return false
+  }
+}
+
+function clearSshMuxSockets(): void {
+  const runtimeDir = getRuntimeSocketDirPath()
+  if (!isSecureOwnedPath(runtimeDir, "dir")) return
+  for (const entry of readdirSync(runtimeDir)) {
+    if (entry.startsWith("m-")) {
+      rmSync(path.join(runtimeDir, entry), { force: true })
+    }
+  }
+}
+
 export async function lockYubiKey(options?: {
   socketPath?: string
   signal?: AbortSignal
 }): Promise<{ ok: boolean; message: string }> {
+  clearSshMuxSockets()
   try {
     const socketPath = await resolveGpgAgentSocketPath(options)
     if (existsSync(socketPath)) {

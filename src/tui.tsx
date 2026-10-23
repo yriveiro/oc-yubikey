@@ -651,13 +651,29 @@ function buildKeymapCommands(actions: TuiCommandActions): readonly KeymapCommand
 }
 
 function resolveActiveTuiLocation(context: Context): LocationRef {
-  if (context.location?.directory) return context.location
   const route = context.ui.router?.current?.()
   if (route?.type === "session" && typeof route.sessionID === "string") {
     const sessionLoc = context.data.session?.get?.(route.sessionID)?.location
     if (sessionLoc?.directory) return sessionLoc
   }
+  if (context.location?.directory) return context.location
   return context.data.location.default()
+}
+
+function collectActiveTuiLocations(context: Context): LocationRef[] {
+  const primary = resolveActiveTuiLocation(context)
+  const locations: LocationRef[] = [primary]
+  const route = context.ui.router?.current?.()
+  if (route?.type === "session" && typeof route.sessionID === "string") {
+    for (const id of context.data.session?.family?.(route.sessionID) ?? []) {
+      const loc = context.data.session?.get?.(id)?.location
+      if (loc?.directory) locations.push(loc)
+    }
+    if (context.location?.directory) {
+      locations.push(context.location)
+    }
+  }
+  return locations
 }
 
 export default Plugin.define({
@@ -721,7 +737,10 @@ export default Plugin.define({
     }
 
     const handleRequested = (req: QueuedRequest) => {
-      if (!isCurrentGen() || !isMatchingLocation(req.location, getLocation())) return
+      const matchesActive = collectActiveTuiLocations(context).some((loc) =>
+        isMatchingLocation(req.location, loc),
+      )
+      if (!isCurrentGen() || !matchesActive) return
       let added = false
       setPendingQueue((prev) => {
         if (prev.some((item) => item.requestID === req.requestID)) return prev

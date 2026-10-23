@@ -434,6 +434,7 @@ declare module "@opencode/plugin/tui/context" {
       }
       readonly session?: {
         get(sessionID: string): { readonly location?: LocationRef } | undefined
+        family?(sessionID: string): readonly string[]
       }
       listen(
         handler: (event: {

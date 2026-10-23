@@ -16,6 +16,7 @@ import type {
 import {
   type VerifyPinResult,
   getYubiKeyCardStatus,
+  isGpgPinCacheWarm,
   verifyYubiKeyPinLoopback,
 } from "./yubikey.ts"
 
@@ -313,6 +314,20 @@ export class PinentryCoordinator {
     return { cancelled: false, verifyRes }
   }
 
+  private async isCardAlreadyUnlocked(
+    card: YubiKeyCardStatus,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    if (card.pinPolicy === "always" || (card.uif?.sign ?? "off") !== "off") {
+      return false
+    }
+    return isGpgPinCacheWarm({
+      socketPath: this.agentSocketPath,
+      aid: card.applicationID,
+      signal,
+    })
+  }
+
   async unlock(
     input: UnlockInput = {},
     options: { signal?: AbortSignal } = {},
@@ -323,6 +338,14 @@ export class PinentryCoordinator {
     const initialRefusal = checkCardUnlockRefusal(card)
     if (initialRefusal) {
       return { ok: false, message: initialRefusal, card }
+    }
+
+    if (await this.isCardAlreadyUnlocked(card, options.signal)) {
+      return {
+        ok: true,
+        message: `YubiKey${card.serial ? ` (${card.serial})` : ""} unlocked and PIN cached in gpg-agent.`,
+        card,
+      }
     }
 
     const allowRetry = (input.allowRetry ?? true) && !isUnpersonalizedOpenPgpCard(card)
