@@ -28,27 +28,44 @@ const TRUSTED_BIN_DIRS = [
   "/bin",
 ]
 
-export function resolveTrustedExecutable(command: string): string {
-  if (path.isAbsolute(command)) return command
+const TRUSTED_SCDAEMON_DIRS = [
+  "/opt/homebrew/opt/gnupg/libexec",
+  "/opt/homebrew/libexec",
+  "/usr/local/MacGPG2/libexec",
+  "/usr/local/opt/gnupg/libexec",
+  "/usr/local/libexec",
+  ...TRUSTED_BIN_DIRS,
+]
+
+export function isTrustedExecutableFile(candidate: string): string | undefined {
+  if (!existsSync(candidate)) return undefined
   const uid = typeof process.getuid === "function" ? process.getuid() : 0
-  for (const dir of TRUSTED_BIN_DIRS) {
-    const candidate = path.join(dir, command)
-    try {
-      if (!existsSync(candidate)) continue
-      const resolved = realpathSync(candidate)
-      const stat = lstatSync(resolved)
-      if (
-        stat.isFile() &&
-        (typeof process.getuid !== "function" || stat.uid === 0 || stat.uid === uid) &&
-        (stat.mode & 0o002) === 0
-      ) {
-        return resolved
-      }
-    } catch {
-      // Try next candidate directory
-    }
+  const resolved = realpathSync(candidate)
+  const stat = lstatSync(resolved)
+  if (!stat.isFile()) return undefined
+  if (typeof process.getuid === "function" && stat.uid !== 0 && stat.uid !== uid) return undefined
+  if ((stat.mode & 0o002) !== 0) return undefined
+  return resolved
+}
+
+export function resolveTrustedExecutable(
+  command: string,
+  searchDirs: readonly string[] = TRUSTED_BIN_DIRS,
+): string {
+  if (path.isAbsolute(command)) return isTrustedExecutableFile(command) ?? command
+  for (const dir of searchDirs) {
+    const resolved = isTrustedExecutableFile(path.join(dir, command))
+    if (resolved) return resolved
   }
   return command
+}
+
+export function resolveTrustedScdaemonExecutable(overrideBin?: string): string {
+  if (overrideBin) {
+    const resolvedOverride = isTrustedExecutableFile(overrideBin)
+    if (resolvedOverride) return resolvedOverride
+  }
+  return resolveTrustedExecutable("scdaemon", TRUSTED_SCDAEMON_DIRS)
 }
 
 export interface ExecResult {
@@ -78,6 +95,7 @@ export function execCommand(
   args: ReadonlyArray<string>,
   options: {
     env?: Record<string, string | undefined>
+    input?: string
     timeoutMs?: number
     signal?: AbortSignal
   } = {},
@@ -89,14 +107,19 @@ export function execCommand(
     }
 
     const resolvedCommand = resolveTrustedExecutable(command)
+    const hasInput = options.input !== undefined
     const child = spawn(resolvedCommand, [...args], {
       env: {
         ...process.env,
         ...options.env,
         PATH: `${TRUSTED_BIN_DIRS.join(":")}:${process.env.PATH ?? ""}`,
       },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [hasInput ? "pipe" : "ignore", "pipe", "pipe"],
     })
+    if (hasInput) {
+      child.stdin.write(options.input!)
+      child.stdin.end()
+    }
 
     let stdout = ""
     let stderr = ""
@@ -721,49 +744,92 @@ function clearSshMuxSockets(): void {
   }
 }
 
+async function sendAgentControlCommands(
+  socketPath: string,
+  commands: readonly string[],
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (!existsSync(socketPath)) return false
+  try {
+    const client = await GpgAgentAssuanClient.connect(socketPath, {
+      signal,
+      timeoutMs: 5_000,
+    })
+    try {
+      let lastOk = true
+      for (const cmd of commands) {
+        const res = await client.command(cmd)
+        lastOk = res.ok
+      }
+      return lastOk
+    } finally {
+      await client.close()
+    }
+  } catch {
+    return false
+  }
+}
+
+async function executeAgentSequence(options: {
+  readonly socketPath: string | undefined
+  readonly commands: readonly string[]
+  readonly cliArgs: readonly string[]
+  readonly env?: Record<string, string | undefined>
+  readonly successMessage: string
+  readonly failureMessage: string
+  readonly signal?: AbortSignal
+}): Promise<{ ok: boolean; message: string }> {
+  if (options.socketPath) {
+    const okOverSocket = await sendAgentControlCommands(
+      options.socketPath,
+      options.commands,
+      options.signal,
+    )
+    if (okOverSocket) {
+      return { ok: true, message: options.successMessage }
+    }
+  }
+  const res = await execCommand("gpg-connect-agent", options.cliArgs, {
+    env: options.env,
+    timeoutMs: 10_000,
+    signal: options.signal,
+  })
+  if (res.code !== 0) {
+    return { ok: false, message: res.stderr.trim() || options.failureMessage }
+  }
+  return { ok: true, message: options.successMessage }
+}
+
+export async function reloadDedicatedGpgAgent(options: {
+  readonly socketPath: string
+  readonly gnupgHome: string
+  readonly signal?: AbortSignal
+}): Promise<{ ok: boolean; message: string }> {
+  return executeAgentSequence({
+    socketPath: options.socketPath,
+    commands: ["RELOADAGENT"],
+    cliArgs: ["RELOADAGENT", "/bye"],
+    env: { GNUPGHOME: options.gnupgHome },
+    successMessage: "Locked OpenCode YubiKey runtime and cleared dedicated gpg-agent cache.",
+    failureMessage: "Failed to reload dedicated OpenCode gpg-agent.",
+    signal: options.signal,
+  })
+}
+
 export async function lockYubiKey(options?: {
   socketPath?: string
   signal?: AbortSignal
 }): Promise<{ ok: boolean; message: string }> {
   clearSshMuxSockets()
-  try {
-    const socketPath = await resolveGpgAgentSocketPath(options)
-    if (existsSync(socketPath)) {
-      const client = await GpgAgentAssuanClient.connect(socketPath, {
-        signal: options?.signal,
-        timeoutMs: 5_000,
-      })
-      try {
-        await client.command("SCD RESET")
-        const reloadRes = await client.command("RELOADAGENT")
-        if (reloadRes.ok) {
-          return {
-            ok: true,
-            message: "Cleared cached YubiKey PIN in scdaemon and reloaded gpg-agent.",
-          }
-        }
-      } finally {
-        await client.close()
-      }
-    }
-  } catch {
-    // Fall back to gpg-connect-agent CLI if socket connection fails
-  }
-
-  const res = await execCommand("gpg-connect-agent", ["SCD RESET", "reloadagent", "/bye"], {
-    timeoutMs: 10_000,
+  const socketPath = await resolveGpgAgentSocketPath(options).catch(() => undefined)
+  return executeAgentSequence({
+    socketPath,
+    commands: ["SCD RESET", "RELOADAGENT"],
+    cliArgs: ["SCD RESET", "reloadagent", "/bye"],
+    successMessage: "Cleared cached YubiKey PIN in scdaemon and reloaded gpg-agent.",
+    failureMessage: "Failed to reset scdaemon / reload gpg-agent.",
     signal: options?.signal,
   })
-  if (res.code !== 0) {
-    return {
-      ok: false,
-      message: res.stderr.trim() || "Failed to reset scdaemon / reload gpg-agent.",
-    }
-  }
-  return {
-    ok: true,
-    message: "Cleared cached YubiKey PIN in scdaemon and reloaded gpg-agent.",
-  }
 }
 
 export async function checkGpgAgentReady(options?: {
