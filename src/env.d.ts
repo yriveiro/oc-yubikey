@@ -8,6 +8,7 @@ interface Buffer extends Uint8Array {
 
 declare var Buffer: {
   alloc(size: number, fill?: number): Buffer
+  byteLength(string: string, encoding?: "utf8" | "hex" | "base64" | "ascii"): number
   from(data: string, encoding?: "utf8" | "hex" | "base64" | "ascii"): Buffer
   from(data: ArrayLike<number> | ArrayBufferView): Buffer
   concat(list: readonly Uint8Array[], totalLength?: number): Buffer
@@ -36,11 +37,13 @@ interface Timer {
 
 declare var process: {
   readonly pid: number
+  readonly execPath: string
   readonly argv: string[]
   readonly env: NodeJS.ProcessEnv
   readonly stdout: NodeJS.WritableStream
   readonly stderr: NodeJS.WritableStream
   readonly stdin: NodeJS.ReadableStream
+  cwd(): string
   getuid?(): number
   exit(code?: number): never
   on(event: "SIGTERM" | "SIGINT" | "SIGHUP", listener: () => void): void
@@ -98,6 +101,12 @@ declare module "node:fs" {
     isSymbolicLink(): boolean
   }
   export function chmodSync(path: string, mode: number): void
+  export function copyFileSync(src: string, dest: string): void
+  export function cpSync(
+    src: string,
+    dest: string,
+    options?: { recursive?: boolean; force?: boolean },
+  ): void
   export function existsSync(path: string): boolean
   export function lstatSync(path: string): Stats
   export function mkdirSync(

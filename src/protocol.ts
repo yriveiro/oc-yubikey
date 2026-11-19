@@ -1,6 +1,8 @@
-import { chmodSync, existsSync, lstatSync, readFileSync, realpathSync } from "node:fs"
+import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
+
+export const MAX_UNIX_SOCKET_PATH_BYTES = 103
 
 export type RequestKind = "pin" | "touch"
 
@@ -35,6 +37,7 @@ export interface IpcTargetResolution {
   readonly socketPath: string | undefined
   readonly token: string | undefined
   readonly command: string | undefined
+  readonly invocationRef?: string
 }
 
 export type SecurePathKind = "dir" | "file" | "socket"
@@ -99,21 +102,34 @@ export function isSshFingerprint(value: string): value is SshFingerprint {
   return value.startsWith("SHA256:") && value.length > "SHA256:".length
 }
 
+function isInvisibleOrDirectionalCode(code: number): boolean {
+  return (
+    code === 0x061c ||
+    (code >= 0x200b && code <= 0x200f) ||
+    (code >= 0x2028 && code <= 0x202e) ||
+    (code >= 0x2066 && code <= 0x2069) ||
+    code === 0xfeff
+  )
+}
+
 export function sanitizeDisplayText(input: string | undefined, maxLen = 240): string | undefined {
   if (input === undefined) return undefined
   let out = ""
   for (let i = 0; i < input.length; i++) {
     const code = input.charCodeAt(i)
+    if (code === 0x0a || code === 0x0d || code === 0x09) {
+      out += " "
+      continue
+    }
     const isControl =
       (code >= 0x00 && code <= 0x08) ||
       (code >= 0x0b && code <= 0x1f) ||
       (code >= 0x7f && code <= 0x9f)
-    const isBidi = (code >= 0x202a && code <= 0x202e) || (code >= 0x2066 && code <= 0x2069)
-    if (!isControl && !isBidi) {
+    if (!isControl && !isInvisibleOrDirectionalCode(code)) {
       out += input[i]
     }
   }
-  const cleaned = out.trim()
+  const cleaned = out.replace(/\s{2,}/g, " ").trim()
   if (!cleaned) return undefined
   return cleaned.length > maxLen ? `${cleaned.slice(0, maxLen - 3)}...` : cleaned
 }
@@ -148,6 +164,38 @@ export function classifyAskpassPrompt(rawPrompt: string): AskpassClassification 
     ...(rawKeyType ? { keyType: rawKeyType } : {}),
     ...(fingerprint ? { fingerprint } : {}),
   }
+}
+
+export function assertMaxSocketPathLength(socketPath: string): string {
+  if (/[\r\n\0]/.test(socketPath)) {
+    throw new Error("Unix socket path contains invalid control characters")
+  }
+  const byteLen = Buffer.byteLength(socketPath, "utf8")
+  if (byteLen === 0 || byteLen > MAX_UNIX_SOCKET_PATH_BYTES) {
+    throw new Error(
+      `Unix socket path exceeds ${MAX_UNIX_SOCKET_PATH_BYTES} bytes (${byteLen}): ${socketPath}`,
+    )
+  }
+  return socketPath
+}
+
+export function assertSafeConfigFilePath(filePath: string, label: string): string {
+  if (!path.isAbsolute(filePath) || /[\r\n\0]/.test(filePath)) {
+    throw new Error(`Unsafe ${label} path: ${filePath}`)
+  }
+  return filePath
+}
+
+export function createSecureRuntimeRoot(prefix = "/tmp/ocyk-"): string {
+  const baseDir = path.dirname(prefix)
+  const resolvedPrefix = existsSync(baseDir)
+    ? prefix
+    : path.join(os.tmpdir(), path.basename(prefix))
+  const dir = mkdtempSync(resolvedPrefix)
+  chmodSync(dir, 0o700)
+  verifySecureSocketDir(dir)
+  assertMaxSocketPathLength(path.join(dir, "c-000000", `m-${"0".repeat(40)}`))
+  return dir
 }
 
 export function getRuntimeSocketDirPath(): string {
@@ -218,6 +266,22 @@ interface IpcTargetCandidate {
   readonly command: string | undefined
 }
 
+function extractInvocationRef(rawUserData: string | undefined): string | undefined {
+  if (!rawUserData) return undefined
+  const trimmed = rawUserData.trim()
+  if (/^[A-Za-z0-9_-]{8,128}$/.test(trimmed)) {
+    return trimmed
+  }
+  const parsed = parseJsonObject(trimmed)
+  return typeof parsed?.ref === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(parsed.ref)
+    ? parsed.ref
+    : undefined
+}
+
+export function isSecureScdaemonSocket(socketPath: string): boolean {
+  return isSecureOwnedPath(socketPath, "socket")
+}
+
 function isLiveIpcSocket(socketPath: string): boolean {
   return (
     isSecureOwnedPath(path.dirname(socketPath), "dir") && isSecureOwnedPath(socketPath, "socket")
@@ -261,8 +325,14 @@ export function resolveIpcTarget(
   env: Readonly<Record<string, string | undefined>> = process.env,
   pointerPath: string = path.join(getRuntimeSocketDirPath(), "active.json"),
 ): IpcTargetResolution {
+  const invocationRef = extractInvocationRef(env.PINENTRY_USER_DATA)
   const userData = parseJsonObject(env.PINENTRY_USER_DATA)
   const candidates: readonly IpcTargetCandidate[] = [
+    {
+      socketPath: env.OC_YUBIKEY_PINENTRY_SOCK,
+      token: env.OC_YUBIKEY_PINENTRY_SECRET,
+      command: typeof userData?.cmd === "string" ? userData.cmd : undefined,
+    },
     {
       socketPath: typeof userData?.sock === "string" ? userData.sock : undefined,
       token: typeof userData?.token === "string" ? userData.token : undefined,
@@ -283,10 +353,16 @@ export function resolveIpcTarget(
       socketPath: candidate.socketPath,
       token: candidate.token,
       command: candidate.command ?? env.OC_YUBIKEY_COMMAND,
+      ...(invocationRef ? { invocationRef } : {}),
     }
   }
 
-  return { socketPath: undefined, token: undefined, command: env.OC_YUBIKEY_COMMAND }
+  return {
+    socketPath: undefined,
+    token: undefined,
+    command: env.OC_YUBIKEY_COMMAND,
+    ...(invocationRef ? { invocationRef } : {}),
+  }
 }
 
 export interface LocationIdentity {

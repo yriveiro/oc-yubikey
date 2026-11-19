@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process"
 import { existsSync, lstatSync, realpathSync } from "node:fs"
 import net from "node:net"
+import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import {
@@ -8,10 +9,12 @@ import {
   encodeAssuanData,
   getRuntimeSocketDirPath,
   isSecureOwnedPath,
+  isSecureScdaemonSocket,
   parseAssuanData,
   parseOptionalInt,
   resolveIpcTarget,
 } from "./protocol.ts"
+import { resolveTrustedScdaemonExecutable } from "./yubikey.ts"
 
 const MAX_IPC_BUFFER_BYTES = 64 * 1024
 const MAX_ASSUAN_LINE_BYTES = 16 * 1024
@@ -27,6 +30,7 @@ interface CliIpcRequestPayload {
   readonly keyType?: string
   readonly fingerprint?: string
   readonly command?: string
+  readonly invocationRef?: string
 }
 
 interface CliIpcResponsePayload {
@@ -95,7 +99,7 @@ function registerSignalCleanup(onTerminate: () => void): void {
 }
 
 async function runAskpassMode(promptArg: string): Promise<void> {
-  const { socketPath, token, command } = resolveIpcTarget()
+  const { socketPath, token, command, invocationRef } = resolveIpcTarget()
   if (!socketPath || !token || !existsSync(socketPath)) {
     process.exit(1)
   }
@@ -105,6 +109,7 @@ async function runAskpassMode(promptArg: string): Promise<void> {
     ...classified,
     token,
     ...(command ? { command } : {}),
+    ...(invocationRef ? { invocationRef } : {}),
   })
 
   registerSignalCleanup(() => {
@@ -616,6 +621,7 @@ interface AssuanExecutionContext {
   readonly socketPath: string | undefined
   readonly token: string | undefined
   readonly command: string | undefined
+  readonly invocationRef: string | undefined
   readonly state: AssuanPinentryState
   getTouchRequest(): ActiveIpcHandle | null
   setTouchRequest(req: ActiveIpcHandle | null): void
@@ -653,18 +659,29 @@ const GETINFO_RESPONSES: Readonly<Record<string, () => string>> = {
 
 const CANCELLED_ASSUAN_LINE = "ERR 83886179 Operation cancelled <Pinentry>\n"
 
-async function handleAssuanConfirm(ctx: AssuanExecutionContext): Promise<string> {
+function sendContextIpcRequest(
+  ctx: AssuanExecutionContext,
+  fields: Omit<CliIpcRequestPayload, "token" | "command" | "invocationRef">,
+): ActiveIpcHandle | undefined {
   if (!ctx.socketPath || !ctx.token || !existsSync(ctx.socketPath)) {
-    return "OK\n"
+    return undefined
   }
-  const req = sendIpcRequest(ctx.socketPath, {
+  return sendIpcRequest(ctx.socketPath, {
+    ...fields,
     token: ctx.token,
+    ...(ctx.command ? { command: ctx.command } : {}),
+    ...(ctx.invocationRef ? { invocationRef: ctx.invocationRef } : {}),
+  })
+}
+
+async function handleAssuanConfirm(ctx: AssuanExecutionContext): Promise<string> {
+  const req = sendContextIpcRequest(ctx, {
     type: "touch",
     title: ctx.state.title || "Touch Your YubiKey",
     description: ctx.state.description || "Please touch your YubiKey to confirm.",
     prompt: "Touch YubiKey",
-    ...(ctx.command ? { command: ctx.command } : {}),
   })
+  if (!req) return "OK\n"
   ctx.setTouchRequest(req)
   try {
     const res = await req.promise
@@ -677,19 +694,15 @@ async function handleAssuanConfirm(ctx: AssuanExecutionContext): Promise<string>
 }
 
 async function handleAssuanGetPin(ctx: AssuanExecutionContext): Promise<string> {
-  if (!ctx.socketPath || !ctx.token || !existsSync(ctx.socketPath)) {
-    return CANCELLED_ASSUAN_LINE
-  }
-  const req = sendIpcRequest(ctx.socketPath, {
-    token: ctx.token,
+  const req = sendContextIpcRequest(ctx, {
     type: "pin",
     title: ctx.state.title || "YubiKey PIN Entry",
     description: ctx.state.description,
     prompt: ctx.state.prompt || "PIN:",
     error: ctx.state.error,
-    ...(ctx.command ? { command: ctx.command } : {}),
   })
   ctx.state.error = undefined
+  if (!req) return CANCELLED_ASSUAN_LINE
   try {
     const res = await req.promise
     if (!res.ok || res.cancelled || typeof res.pin !== "string") {
@@ -786,7 +799,7 @@ function attachAssuanStdinReader(ctx: AssuanExecutionContext): void {
 }
 
 function runAssuanPinentryMode(args: readonly string[]): void {
-  const { socketPath, token, command } = resolveIpcTarget()
+  const { socketPath, token, command, invocationRef } = resolveIpcTarget()
   if ((!socketPath || !token || !existsSync(socketPath)) && spawnFallbackPinentry(args)) {
     return
   }
@@ -808,6 +821,7 @@ function runAssuanPinentryMode(args: readonly string[]): void {
     socketPath,
     token,
     command,
+    invocationRef,
     state: { title: undefined, description: undefined, prompt: undefined, error: undefined },
     getTouchRequest: () => currentTouchRequest,
     setTouchRequest: (req) => {
@@ -818,6 +832,129 @@ function runAssuanPinentryMode(args: readonly string[]): void {
 
   process.stdout.write("OK Pleased to meet you\n")
   attachAssuanStdinReader(ctx)
+}
+
+function relayStdioToSocket(socketPath: string): void {
+  const sock = net.createConnection({ path: socketPath })
+  registerSignalCleanup(() => {
+    sock.destroy()
+    process.exit(0)
+  })
+  process.stdin.on("data", (chunk: Buffer | string) => {
+    if (!sock.destroyed) sock.write(chunk)
+  })
+  process.stdin.on("end", () => sock.end())
+  process.stdin.on("error", () => sock.end())
+  sock.on("data", (chunk: Buffer) => {
+    process.stdout.write(chunk)
+  })
+  sock.on("close", () => process.exit(0))
+  sock.on("error", () => process.exit(1))
+}
+
+function relayStandaloneScdaemonSocket(targetSock: string): void {
+  const sock = net.createConnection({ path: targetSock })
+  let greeted = false
+  let buffer = ""
+  const pending: string[] = []
+
+  const forwardLine = (line: string): void => {
+    if (/^OPTION\s+event-signal=/i.test(line) || /^(KILLSCDAEMON|RESTART|RESET)$/i.test(line)) {
+      process.stdout.write("OK\n")
+      return
+    }
+    if (/^GETINFO\s+socket_name/i.test(line)) {
+      process.stdout.write("ERR 67109139 Unknown option <SCD>\n")
+      return
+    }
+    if (!sock.destroyed) sock.write(`${line}\n`)
+  }
+
+  registerSignalCleanup(() => {
+    sock.destroy()
+    process.exit(0)
+  })
+
+  sock.on("data", (chunk: Buffer) => {
+    process.stdout.write(chunk)
+    if (!greeted) {
+      greeted = true
+      for (const item of pending) forwardLine(item)
+      pending.length = 0
+    }
+  })
+  sock.on("close", () => process.exit(0))
+  sock.on("error", () => process.exit(1))
+
+  process.stdin.on("data", (chunk: Buffer | string) => {
+    buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8")
+    if (buffer.length > MAX_ASSUAN_LINE_BYTES) {
+      sock.destroy()
+      process.exit(1)
+    }
+    let idx = buffer.indexOf("\n")
+    while (idx !== -1) {
+      const line = buffer.slice(0, idx).replace(/\r$/, "").trim()
+      buffer = buffer.slice(idx + 1)
+      idx = buffer.indexOf("\n")
+      if (!line) continue
+      if (!greeted) pending.push(line)
+      else forwardLine(line)
+    }
+  })
+  process.stdin.on("end", () => sock.end())
+}
+
+function spawnFallbackSharedScdaemon(args: readonly string[]): void {
+  const scdBin = resolveTrustedScdaemonExecutable(process.env.OC_YUBIKEY_SCDAEMON_BIN)
+  const passthrough = args.filter(
+    (arg) =>
+      arg !== "--multi-server" &&
+      arg !== "--disable-ccid" &&
+      arg !== "--pcsc-shared" &&
+      arg !== "--card-timeout",
+  )
+  const child = spawn(
+    scdBin,
+    ["--multi-server", "--disable-ccid", "--pcsc-shared", "--card-timeout", "5", ...passthrough],
+    { stdio: "inherit" },
+  )
+  registerSignalCleanup(() => child.kill("SIGTERM"))
+  child.on("exit", (code) => process.exit(code ?? 0))
+  child.on("error", () => process.exit(127))
+}
+
+function runScdaemonBridgeMode(args: readonly string[]): void {
+  const isQueryFlag = args.some(
+    (arg) =>
+      arg === "--version" ||
+      arg === "--help" ||
+      arg === "--dump-options" ||
+      arg === "--gpgconf-list" ||
+      arg === "--gpgconf-test",
+  )
+  if (isQueryFlag) {
+    const scdBin = resolveTrustedScdaemonExecutable(process.env.OC_YUBIKEY_SCDAEMON_BIN)
+    const child = spawn(scdBin, [...args], { stdio: "inherit" })
+    child.on("exit", (code) => process.exit(code ?? 0))
+    child.on("error", () => process.exit(127))
+    return
+  }
+
+  const daemonScdSock = process.env.OC_YUBIKEY_SCD_SOCK
+  if (daemonScdSock && isSecureScdaemonSocket(daemonScdSock)) {
+    relayStdioToSocket(daemonScdSock)
+    return
+  }
+
+  const sysSock =
+    process.env.OC_YUBIKEY_SYS_SCDAEMON_SOCK ?? path.join(os.homedir(), ".gnupg", "S.scdaemon")
+  if (isSecureScdaemonSocket(sysSock)) {
+    relayStandaloneScdaemonSocket(sysSock)
+    return
+  }
+
+  spawnFallbackSharedScdaemon(args)
 }
 
 const VALUE_FLAGS = new Set<string>([
@@ -858,7 +995,12 @@ const isSshWrapperInvocation =
   invokedBinName === "oc-yubikey-ssh" ||
   rawArgs[0] === "--ssh-wrapper"
 
-if (isGpgWrapperInvocation) {
+const isScdaemonBridgeInvocation =
+  process.env.OC_YUBIKEY_MODE === "scd" || rawArgs[0] === "--scdaemon-bridge"
+
+if (isScdaemonBridgeInvocation) {
+  runScdaemonBridgeMode(rawArgs[0] === "--scdaemon-bridge" ? rawArgs.slice(1) : rawArgs)
+} else if (isGpgWrapperInvocation) {
   runGpgWrapperMode(rawArgs[0] === "--gpg-wrapper" ? rawArgs.slice(1) : rawArgs)
 } else if (isSshWrapperInvocation) {
   runSshWrapperMode(rawArgs[0] === "--ssh-wrapper" ? rawArgs.slice(1) : rawArgs)
